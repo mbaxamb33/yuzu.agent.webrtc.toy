@@ -47,6 +47,11 @@ func (s *Store) AppendEvent(sessionID, typ string, payload map[string]any) types
     s.mu.Lock()
     defer s.mu.Unlock()
     s.events[sessionID] = append(s.events[sessionID], evt)
+    // Cap total events per session to avoid unbounded growth
+    const maxEvents = 200
+    if len(s.events[sessionID]) > maxEvents {
+        s.events[sessionID] = append([]types.Event(nil), s.events[sessionID][len(s.events[sessionID])-maxEvents:]...)
+    }
     return evt
 }
 
@@ -71,3 +76,19 @@ func (s *Store) IsBotRunning(sessionID string) bool {
     return s.botRunning[sessionID]
 }
 
+func (s *Store) SetBotPID(sessionID string, pid int) {
+    s.mu.Lock()
+    if sess, ok := s.sessions[sessionID]; ok {
+        sess.BotPID = pid
+    }
+    s.mu.Unlock()
+}
+
+func (s *Store) SetBotExit(sessionID string, code int, at time.Time) {
+    s.mu.Lock()
+    if sess, ok := s.sessions[sessionID]; ok {
+        sess.BotLastExitCode = code
+        sess.BotLastExitAt = &at
+    }
+    s.mu.Unlock()
+}

@@ -75,6 +75,13 @@ func (h *Handlers) HandleStartSession(w http.ResponseWriter, r *http.Request, id
         http.NotFound(w, r)
         return
     }
+    running := h.store.IsBotRunning(id)
+    if running {
+        h.store.AppendEvent(id, "bot_start_requested", map[string]any{"noop": true})
+        w.Header().Set("Content-Type", "application/json")
+        _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "running": true})
+        return
+    }
     h.store.AppendEvent(id, "bot_start_requested", nil)
 
     env := map[string]string{
@@ -93,7 +100,7 @@ func (h *Handlers) HandleStartSession(w http.ResponseWriter, r *http.Request, id
     h.store.AppendEvent(id, "bot_started", nil)
 
     w.Header().Set("Content-Type", "application/json")
-    _ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+    _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "running": true})
 }
 
 func (h *Handlers) HandleEndSession(w http.ResponseWriter, r *http.Request, id string) {
@@ -102,15 +109,22 @@ func (h *Handlers) HandleEndSession(w http.ResponseWriter, r *http.Request, id s
         http.NotFound(w, r)
         return
     }
+    running := h.runner.IsRunning(id)
+    if !running {
+        h.store.AppendEvent(id, "bot_stop_requested", map[string]any{"noop": true})
+        w.Header().Set("Content-Type", "application/json")
+        _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "running": false})
+        return
+    }
     h.store.AppendEvent(id, "bot_stop_requested", nil)
-    if h.runner.IsRunning(id) {
+    if running {
         _ = h.runner.Stop(id)
         h.store.SetBotRunning(id, false)
     }
     h.store.AppendEvent(id, "bot_stopped", nil)
 
     w.Header().Set("Content-Type", "application/json")
-    _ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+    _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "running": false})
 }
 
 func (h *Handlers) HandleListEvents(w http.ResponseWriter, r *http.Request, id string) {

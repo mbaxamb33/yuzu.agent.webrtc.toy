@@ -44,7 +44,7 @@ func Load() Config {
     v.SetDefault("daily.room_prefix", "ai-interview-")
     v.SetDefault("daily.room_privacy", "private")
     v.SetDefault("daily.bot_name", "AI Interviewer")
-    v.SetDefault("daily.bot_token_exp_min", 60)
+    v.SetDefault("daily.bot_token_exp_min", 720)
 
     v.SetDefault("bot.stay_connected_seconds", 30)
 

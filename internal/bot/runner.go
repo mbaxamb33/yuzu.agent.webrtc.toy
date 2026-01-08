@@ -21,10 +21,14 @@ type Runner interface {
 
 // ExitCallback is invoked when a session's worker process exits (naturally or killed).
 type ExitCallback func(sessionID string, err error)
+type LogCallback func(sessionID string, stream string, line string)
+type StartCallback func(sessionID string, pid int)
 
 type LocalRunner struct {
     workerCmd string
     onExit    ExitCallback
+    onLog     LogCallback
+    onStart   StartCallback
 
     mu   sync.Mutex
     procs map[string]*proc
@@ -35,10 +39,12 @@ type proc struct {
     cancel context.CancelFunc
 }
 
-func NewLocalRunner(workerCmd string, onExit ExitCallback) *LocalRunner {
+func NewLocalRunner(workerCmd string, onExit ExitCallback, onLog LogCallback, onStart StartCallback) *LocalRunner {
     return &LocalRunner{
         workerCmd: workerCmd,
         onExit:    onExit,
+        onLog:     onLog,
+        onStart:   onStart,
         procs:     make(map[string]*proc),
     }
 }
@@ -82,9 +88,13 @@ func (r *LocalRunner) Start(sessionID string, env map[string]string) error {
     r.procs[sessionID] = &proc{cmd: cmd, cancel: cancel}
     r.mu.Unlock()
 
+    if r.onStart != nil && cmd.Process != nil {
+        r.onStart(sessionID, cmd.Process.Pid)
+    }
+
     // Log stdout/stderr
-    go stream("bot["+sessionID+"] stdout", stdout)
-    go stream("bot["+sessionID+"] stderr", stderr)
+    go r.stream(sessionID, "stdout", stdout)
+    go r.stream(sessionID, "stderr", stderr)
 
     // Wait and cleanup
     go func() {
@@ -139,9 +149,13 @@ func envFromOS() []string {
     return out
 }
 
-func stream(prefix string, rdr interface{ Read([]byte) (int, error) }) {
+func (r *LocalRunner) stream(sessionID, stream string, rdr interface{ Read([]byte) (int, error) }) {
     scanner := bufio.NewScanner(rdr)
     for scanner.Scan() {
-        log.Printf("%s: %s", prefix, scanner.Text())
+        line := scanner.Text()
+        log.Printf("bot[%s] %s: %s", sessionID, stream, line)
+        if r.onLog != nil {
+            r.onLog(sessionID, stream, line)
+        }
     }
 }

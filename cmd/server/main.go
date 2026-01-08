@@ -22,9 +22,19 @@ func main() {
     runner := bot.NewLocalRunner(cfg.Bot.WorkerCmd, func(sessionID string, err error) {
         // On process exit, mark not running and append event.
         st.SetBotRunning(sessionID, false)
+        code := 0
+        if err != nil {
+            // best-effort: exec.ExitError carries code; we won't type-assert here to keep it minimal
+            code = 1
+        }
+        st.SetBotExit(sessionID, code, time.Now().UTC())
         st.AppendEvent(sessionID, "bot_exit", map[string]any{
             "error": errString(err),
         })
+    }, func(sessionID, stream, line string) {
+        st.AppendEvent(sessionID, "bot_log", map[string]any{"stream": stream, "line": line})
+    }, func(sessionID string, pid int) {
+        st.SetBotPID(sessionID, pid)
     })
 
     h := api.NewHandlers(cfg, st, dailyClient, runner)
