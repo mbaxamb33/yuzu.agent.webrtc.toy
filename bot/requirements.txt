@@ -1,4 +1,3 @@
-requests
-numpy
-soundfile
-pipecat-ai
+requests==2.31.0
+numpy==1.26.4
+pipecat-ai==0.1.38
