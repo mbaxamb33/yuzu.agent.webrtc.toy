@@ -16,6 +16,7 @@ help:
 	@echo "  make vet      - Static analysis with go vet"
 	@echo "  make tidy     - Sync go.mod/go.sum"
 	@echo "  make clean    - Remove build artifacts"
+	@echo "  make smoke1   - Run smoke test script (requires server running)"
 
 server:
 	$(GO) run $(SERVER_PKG)
@@ -39,3 +40,6 @@ tidy:
 clean:
 	rm -rf $(BIN_DIR)
 
+.PHONY: smoke1
+smoke1:
+	bash scripts/smoke_part1.sh
