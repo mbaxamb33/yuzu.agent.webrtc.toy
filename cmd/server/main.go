@@ -8,6 +8,7 @@ import (
     "os"
     "os/exec"
     "os/signal"
+    "syscall"
     "time"
 
 	"yuzu/agent/internal/api"
@@ -49,10 +50,16 @@ func main() {
 
 	// Graceful shutdown on SIGINT/SIGTERM
 	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt)
-	go func() {
-		<-sigc
-		log.Printf("shutdown signal received; stopping server...")
+    signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+    go func() {
+        <-sigc
+        log.Printf("shutdown signal received; stopping server...")
+        // Stop running bots before draining HTTP
+        for _, id := range st.ListSessionIDs() {
+            if runner.IsRunning(id) {
+                _ = runner.Stop(id)
+            }
+        }
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
         _ = srv.Shutdown(ctx)
@@ -64,12 +71,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Stop any running bots
-	for _, id := range st.ListSessionIDs() {
-		if runner.IsRunning(id) {
-			_ = runner.Stop(id)
-		}
-	}
+    // Bots already stopped in signal handler above
 }
 
 func errString(err error) string {

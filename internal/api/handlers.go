@@ -142,15 +142,15 @@ func (h *Handlers) HandleEndSession(w http.ResponseWriter, r *http.Request, id s
 }
 
 func (h *Handlers) HandleListEvents(w http.ResponseWriter, r *http.Request, id string) {
-	sess := h.store.GetSession(id)
-	if sess == nil {
-		http.NotFound(w, r)
-		return
-	}
-	events := h.store.ListEvents(id)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"session_id": id,
-		"events":     events,
-	})
+    sess := h.store.GetSession(id)
+    if sess == nil {
+        http.NotFound(w, r)
+        return
+    }
+    events := h.store.ListEvents(id)
+    w.Header().Set("Content-Type", "application/json")
+    if err := json.NewEncoder(w).Encode(map[string]any{
+        "session_id": id,
+        "events":     events,
+    }); err != nil { log.Printf("encode error: %v", err) }
 }
