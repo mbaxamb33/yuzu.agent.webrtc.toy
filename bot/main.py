@@ -50,7 +50,21 @@ def decode_wav_pcm16(wav_bytes):
     pcm = np.frombuffer(raw, dtype=np.int16)
     if n_channels == 2:
         pcm = pcm.reshape(-1, 2).mean(axis=1).astype(np.int16)
-    return pcm.tobytes(), framerate
+    return pcm, framerate, n_channels
+
+def resample_to_48k(pcm_int16, sr):
+    import numpy as np
+    target = 48000
+    if sr == target:
+        return pcm_int16
+    x = pcm_int16.astype(np.float32) / 32768.0
+    old_len = len(x)
+    new_len = int(round(old_len * target / sr))
+    old_idx = np.linspace(0.0, 1.0, old_len, endpoint=False)
+    new_idx = np.linspace(0.0, 1.0, new_len, endpoint=False)
+    y = np.interp(new_idx, old_idx, x)
+    y_int16 = np.clip(y * 32768.0, -32768, 32767).astype(np.int16)
+    return y_int16
 
 def pace_and_send_audio_pcm16(transport, pcm16_bytes, sr):
     # 20ms frames for 16-bit mono PCM
@@ -60,14 +74,17 @@ def pace_and_send_audio_pcm16(transport, pcm16_bytes, sr):
     sent_frames = 0
     pos = 0
     started_ms = int(time.time() * 1000)
+    method = 'unknown'
     while pos < len(pcm16_bytes):
         chunk = pcm16_bytes[pos:pos+bytes_per_frame]
         pos += bytes_per_frame
         try:
             if hasattr(transport, 'send_audio_pcm16'):
                 transport.send_audio_pcm16(chunk, sample_rate=sr)
+                method = 'send_audio_pcm16'
             elif hasattr(transport, 'send_audio'):
                 transport.send_audio(chunk, sample_rate=sr)
+                method = 'send_audio'
             else:
                 raise RuntimeError('transport has no audio send method')
             sent_frames += 1
@@ -75,8 +92,10 @@ def pace_and_send_audio_pcm16(transport, pcm16_bytes, sr):
             raise
         time.sleep(0.02)
     duration_ms = int(time.time() * 1000) - started_ms
+    log(f"AUDIO_FORMAT sr={sr} channels=1 width=2 frame_ms=20 samples_per_frame={samples_per_frame}")
     log(f"PUBLISHED_AUDIO_FRAMES={sent_frames}")
     log(f"AUDIO_SENT_MS={duration_ms}")
+    log(f"TRANSPORT_METHOD={method}")
 
 def try_join_daily(room_url, token):
     # Try Pipecat DailyTransport
@@ -114,10 +133,13 @@ def main():
     log("TTS_START")
     try:
         wav_bytes = fetch_tts_wav(eleven_api_key, voice_id, phrase)
-        pcm16_bytes, sr = decode_wav_pcm16(wav_bytes)
+        pcm_arr, sr_in, ch = decode_wav_pcm16(wav_bytes)
+        # Force mono 48k PCM16
+        pcm_arr_48k = resample_to_48k(pcm_arr, sr_in)
+        pcm16_bytes = pcm_arr_48k.tobytes()
         log("TTS_DONE")
         try:
-            pace_and_send_audio_pcm16(transport, pcm16_bytes, sr)
+            pace_and_send_audio_pcm16(transport, pcm16_bytes, 48000)
         except Exception as e:
             eprint("publish error:", e)
             log("BOT_ERROR {\"stage\":\"publish\",\"error\":\"send failed\"}")
