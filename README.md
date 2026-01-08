@@ -19,3 +19,22 @@ The system must support:
   - **Structured transcript**
   - **Event timeline** (who spoke, when, interruptions, turn boundaries, etc.)
   - Later: **report**
+
+## Dev quickstart
+
+- Build: `make build` (outputs `bin/server`)
+- Run: `make server` (uses `go run ./cmd/server`)
+- Test: `make test`
+- Format: `make fmt` | Lint: `make vet`
+
+Env vars you can set when running (optional):
+
+- `SERVER_ADDR` (default `:8080`)
+- `DAILY_DOMAIN_URL` (e.g. `https://your-team.daily.co`)
+- `DAILY_API_KEY`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`
+
+Example:
+
+```bash
+SERVER_ADDR=":8081" DAILY_DOMAIN_URL="https://your-team.daily.co" make server
+```
