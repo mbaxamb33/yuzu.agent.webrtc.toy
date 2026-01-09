@@ -9,10 +9,10 @@ import (
 )
 
 type Config struct {
-	Server struct {
-		Port     string
-		LogLevel string
-	}
+    Server struct {
+        Port     string
+        LogLevel string
+    }
 	Daily struct {
 		APIKey         string
 		Domain         string
@@ -21,15 +21,20 @@ type Config struct {
 		BotName        string
 		BotTokenExpMin int
 	}
-	Bot struct {
-		WorkerCmd            string
-		StayConnectedSeconds string
-	}
-	Eleven struct {
-		APIKey       string
-		VoiceID      string
-		CannedPhrase string
-	}
+    Bot struct {
+        WorkerCmd            string
+        StayConnectedSeconds string
+    }
+    Eleven struct {
+        APIKey       string
+        VoiceID      string
+        CannedPhrase string
+    }
+    Worker struct {
+        TokenSecret       string
+        TokenTTLSecs      int
+        TokenSkewSecs     int
+    }
 }
 
 func Load() Config {
@@ -48,7 +53,10 @@ func Load() Config {
 
 	v.SetDefault("bot.stay_connected_seconds", 30)
 
-	v.SetDefault("elevenlabs.canned_phrase", "Hi, I'm your AI interviewer. Can you hear me clearly?")
+    v.SetDefault("elevenlabs.canned_phrase", "Hi, I'm your AI interviewer. Can you hear me clearly?")
+
+    v.SetDefault("worker.token_ttl_seconds", 1800)
+    v.SetDefault("worker.token_skew_seconds", 60)
 
 	// Map envs
 	v.BindEnv("server.port", "PORT")
@@ -66,7 +74,11 @@ func Load() Config {
 
 	v.BindEnv("elevenlabs.api_key", "ELEVENLABS_API_KEY")
 	v.BindEnv("elevenlabs.voice_id", "ELEVENLABS_VOICE_ID")
-	v.BindEnv("elevenlabs.canned_phrase", "ELEVENLABS_CANNED_PHRASE")
+    v.BindEnv("elevenlabs.canned_phrase", "ELEVENLABS_CANNED_PHRASE")
+
+    v.BindEnv("worker.token_secret", "WORKER_TOKEN_SECRET")
+    v.BindEnv("worker.token_ttl_seconds", "WORKER_TOKEN_TTL_SECONDS")
+    v.BindEnv("worker.token_skew_seconds", "WORKER_TOKEN_SKEW_SECONDS")
 
 	var c Config
 	c.Server.Port = toString(v.Get("server.port"))
@@ -82,9 +94,13 @@ func Load() Config {
 	c.Bot.WorkerCmd = v.GetString("bot.worker_cmd")
 	c.Bot.StayConnectedSeconds = toString(v.Get("bot.stay_connected_seconds"))
 
-	c.Eleven.APIKey = v.GetString("elevenlabs.api_key")
-	c.Eleven.VoiceID = v.GetString("elevenlabs.voice_id")
-	c.Eleven.CannedPhrase = v.GetString("elevenlabs.canned_phrase")
+    c.Eleven.APIKey = v.GetString("elevenlabs.api_key")
+    c.Eleven.VoiceID = v.GetString("elevenlabs.voice_id")
+    c.Eleven.CannedPhrase = v.GetString("elevenlabs.canned_phrase")
+
+    c.Worker.TokenSecret = v.GetString("worker.token_secret")
+    c.Worker.TokenTTLSecs = v.GetInt("worker.token_ttl_seconds")
+    c.Worker.TokenSkewSecs = v.GetInt("worker.token_skew_seconds")
 
 	log.Printf("config loaded: port=%s daily_domain=%s", c.Server.Port, c.Daily.Domain)
 	return c

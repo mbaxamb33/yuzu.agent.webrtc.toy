@@ -11,14 +11,19 @@ import (
     "syscall"
     "time"
 
-	"yuzu/agent/internal/api"
-	"yuzu/agent/internal/bot"
-	"yuzu/agent/internal/config"
-	"yuzu/agent/internal/daily"
-	"yuzu/agent/internal/store"
+    "github.com/joho/godotenv"
+    "yuzu/agent/internal/api"
+    "yuzu/agent/internal/bot"
+    "yuzu/agent/internal/config"
+    "yuzu/agent/internal/daily"
+    "yuzu/agent/internal/store"
+    "yuzu/agent/internal/workerws"
 )
 
 func main() {
+	// Load .env file if present (ignored if missing)
+	_ = godotenv.Load()
+
 	cfg := config.Load()
 
 	st := store.New()
@@ -38,8 +43,13 @@ func main() {
 		st.SetBotPID(sessionID, pid)
 	})
 
-	h := api.NewHandlers(cfg, st, dailyClient, runner)
-	mux := api.NewRouter(h)
+    h := api.NewHandlers(cfg, st, dailyClient, runner)
+    mux := http.NewServeMux()
+    mux.Handle("/", api.NewRouter(h))
+    // WS worker route
+    reg := workerws.NewRegistry()
+    wss := workerws.NewServer(cfg, st, reg)
+    mux.HandleFunc("/ws/worker", wss.HandleWorkerWS)
 
 	addr := ":" + cfg.Server.Port
 	srv := &http.Server{

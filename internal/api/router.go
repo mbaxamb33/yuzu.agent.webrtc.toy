@@ -6,7 +6,7 @@ import (
 )
 
 func NewRouter(h *Handlers) http.Handler {
-	mux := http.NewServeMux()
+    mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -21,7 +21,7 @@ func NewRouter(h *Handlers) http.Handler {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
-	mux.HandleFunc("/sessions/", func(w http.ResponseWriter, r *http.Request) {
+    mux.HandleFunc("/sessions/", func(w http.ResponseWriter, r *http.Request) {
 		// /sessions/{id}/start | /end | /events
 		path := strings.TrimSuffix(r.URL.Path, "/")
 		const prefix = "/sessions/"
@@ -67,7 +67,7 @@ func NewRouter(h *Handlers) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-	})
+    })
 
-	return mux
+    return mux
 }
