@@ -47,13 +47,15 @@ func main() {
 	h := api.NewHandlers(cfg, st, dailyClient, runner)
 	mux := http.NewServeMux()
 	mux.Handle("/", api.NewRouter(h))
-	// WS worker route
-	reg := workerws.NewRegistry()
-	wss := workerws.NewServer(cfg, st, reg)
-	// Dispatcher for Loop A floor control
-	disp := loop.New(reg, st, 60)
-	wss.OnMessage = disp.OnMessage
-	mux.HandleFunc("/ws/worker", wss.HandleWorkerWS)
+    // WS worker route
+    reg := workerws.NewRegistry()
+    wss := workerws.NewServer(cfg, st, reg)
+    // Dispatcher for Loop A floor control
+    disp := loop.New(reg, st, cfg.Floor.TTSTimeoutSeconds)
+    wss.OnMessage = disp.OnMessage
+    mux.HandleFunc("/ws/worker", wss.HandleWorkerWS)
+    // Wire dispatcher to REST debug endpoints
+    h.SetOnWorkerMessage(disp.OnMessage)
 
 	addr := ":" + cfg.Server.Port
 	srv := &http.Server{

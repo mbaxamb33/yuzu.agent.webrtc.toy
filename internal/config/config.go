@@ -35,6 +35,13 @@ type Config struct {
         TokenTTLSecs      int
         TokenSkewSecs     int
     }
+    Floor struct {
+        TTSTimeoutSeconds int
+    }
+    Dev struct {
+        Mode bool
+        Key  string
+    }
 }
 
 func Load() Config {
@@ -57,7 +64,9 @@ func Load() Config {
 
     v.SetDefault("worker.token_ttl_seconds", 1800)
     v.SetDefault("worker.token_skew_seconds", 60)
+    v.SetDefault("floor.tts_timeout_seconds", 60)
 
+    v.SetDefault("dev.mode", false)
 	// Map envs
 	v.BindEnv("server.port", "PORT")
 	v.BindEnv("server.log_level", "LOG_LEVEL")
@@ -79,6 +88,9 @@ func Load() Config {
     v.BindEnv("worker.token_secret", "WORKER_TOKEN_SECRET")
     v.BindEnv("worker.token_ttl_seconds", "WORKER_TOKEN_TTL_SECONDS")
     v.BindEnv("worker.token_skew_seconds", "WORKER_TOKEN_SKEW_SECONDS")
+    v.BindEnv("floor.tts_timeout_seconds", "FLOOR_TTS_TIMEOUT_SECONDS")
+    v.BindEnv("dev.mode", "DEV_MODE")
+    v.BindEnv("dev.key", "DEV_KEY")
 
 	var c Config
 	c.Server.Port = toString(v.Get("server.port"))
@@ -101,6 +113,9 @@ func Load() Config {
     c.Worker.TokenSecret = v.GetString("worker.token_secret")
     c.Worker.TokenTTLSecs = v.GetInt("worker.token_ttl_seconds")
     c.Worker.TokenSkewSecs = v.GetInt("worker.token_skew_seconds")
+    c.Floor.TTSTimeoutSeconds = v.GetInt("floor.tts_timeout_seconds")
+    c.Dev.Mode = v.GetBool("dev.mode")
+    c.Dev.Key = v.GetString("dev.key")
 
 	log.Printf("config loaded: port=%s daily_domain=%s", c.Server.Port, c.Daily.Domain)
 	return c

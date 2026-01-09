@@ -1,29 +1,34 @@
 package api
 
 import (
-	"encoding/json"
-	"log"
-	"net/http"
-	"time"
+    "encoding/json"
+    "log"
+    "net/http"
+    "time"
 
-	"github.com/google/uuid"
-	"yuzu/agent/internal/bot"
-	"yuzu/agent/internal/config"
-	"yuzu/agent/internal/daily"
-	"yuzu/agent/internal/store"
-	"yuzu/agent/internal/types"
+    "github.com/google/uuid"
+    "yuzu/agent/internal/bot"
+    "yuzu/agent/internal/config"
+    "yuzu/agent/internal/daily"
+    "yuzu/agent/internal/auth"
+    "yuzu/agent/internal/store"
+    "yuzu/agent/internal/types"
+    "yuzu/agent/internal/workerws"
 )
 
 type Handlers struct {
-	cfg    config.Config
-	store  *store.Store
-	daily  daily.Client
-	runner bot.Runner
+    cfg    config.Config
+    store  *store.Store
+    daily  daily.Client
+    runner bot.Runner
+    onWorkerMsg func(sessionID string, msg workerws.Message)
 }
 
 func NewHandlers(cfg config.Config, st *store.Store, d daily.Client, r bot.Runner) *Handlers {
-	return &Handlers{cfg: cfg, store: st, daily: d, runner: r}
+    return &Handlers{cfg: cfg, store: st, daily: d, runner: r}
 }
+
+func (h *Handlers) SetOnWorkerMessage(fn func(sessionID string, msg workerws.Message)) { h.onWorkerMsg = fn }
 
 func (h *Handlers) HandleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Daily.APIKey == "" || h.cfg.Daily.Domain == "" {
@@ -153,4 +158,58 @@ func (h *Handlers) HandleListEvents(w http.ResponseWriter, r *http.Request, id s
         "session_id": id,
         "events":     events,
     }); err != nil { log.Printf("encode error: %v", err) }
+}
+
+// Dev-only: mint worker token
+func (h *Handlers) HandleMintWorkerToken(w http.ResponseWriter, r *http.Request, id string) {
+    if !h.devAuthorized(r) {
+        http.Error(w, "forbidden", http.StatusForbidden)
+        return
+    }
+    if h.cfg.Worker.TokenSecret == "" {
+        http.Error(w, "worker token not configured", http.StatusBadRequest)
+        return
+    }
+    if h.store.GetSession(id) == nil {
+        http.Error(w, "unknown session", http.StatusNotFound)
+        return
+    }
+    exp := time.Now().Add(time.Duration(h.cfg.Worker.TokenTTLSecs) * time.Second).Unix()
+    tok, err := auth.GenerateWorkerToken(h.cfg.Worker.TokenSecret, id, exp)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    w.Header().Set("Content-Type", "application/json")
+    if err := json.NewEncoder(w).Encode(map[string]any{"token": tok, "exp_unix": exp}); err != nil { log.Printf("encode error: %v", err) }
+}
+
+// Dev-only: inject VAD start/end
+func (h *Handlers) HandleDebugVAD(w http.ResponseWriter, r *http.Request, id string, typ string) {
+    if !h.devAuthorized(r) {
+        http.Error(w, "forbidden", http.StatusForbidden)
+        return
+    }
+    if h.store.GetSession(id) == nil {
+        http.Error(w, "unknown session", http.StatusNotFound)
+        return
+    }
+    if h.onWorkerMsg == nil {
+        http.Error(w, "dispatcher not ready", http.StatusServiceUnavailable)
+        return
+    }
+    msg := workerws.Message{Type: typ, TsMs: time.Now().UnixMilli(), SessionID: id, Seq: 0, Payload: map[string]any{"source":"debug"}}
+    h.onWorkerMsg(id, msg)
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (h *Handlers) devAuthorized(r *http.Request) bool {
+    if h.cfg.Dev.Mode {
+        return true
+    }
+    if h.cfg.Dev.Key == "" {
+        return false
+    }
+    return r.Header.Get("X-Dev-Key") == h.cfg.Dev.Key
 }

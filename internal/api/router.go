@@ -41,32 +41,51 @@ func NewRouter(h *Handlers) http.Handler {
 			tail = parts[1]
 		}
 
-		switch tail {
-		case "start":
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			h.HandleStartSession(w, r, id)
-			return
-		case "end":
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			h.HandleEndSession(w, r, id)
-			return
-		case "events":
-			if r.Method != http.MethodGet {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			h.HandleListEvents(w, r, id)
-			return
-		default:
-			http.NotFound(w, r)
-			return
-		}
+        switch tail {
+        case "start":
+            if r.Method != http.MethodPost {
+                http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+                return
+            }
+            h.HandleStartSession(w, r, id)
+            return
+        case "end":
+            if r.Method != http.MethodPost {
+                http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+                return
+            }
+            h.HandleEndSession(w, r, id)
+            return
+        case "events":
+            if r.Method != http.MethodGet {
+                http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+                return
+            }
+            h.HandleListEvents(w, r, id)
+            return
+        case "worker-token":
+            if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+            h.HandleMintWorkerToken(w, r, id)
+            return
+        case "debug":
+            if len(parts) < 3 { http.NotFound(w, r); return }
+            action := parts[2]
+            if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+            switch action {
+            case "vad-start":
+                h.HandleDebugVAD(w, r, id, "vad_start")
+                return
+            case "vad-end":
+                h.HandleDebugVAD(w, r, id, "vad_end")
+                return
+            default:
+                http.NotFound(w, r)
+                return
+            }
+        default:
+            http.NotFound(w, r)
+            return
+        }
     })
 
     return mux
