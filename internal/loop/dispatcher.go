@@ -76,8 +76,13 @@ func (d *Dispatcher) OnMessage(sessionID string, msg workerws.Message) {
     case "vad_start":
         s.lastVADTsMs = msg.TsMs
         s.lastVADRecvMs = nowRecvMs
+        // Only treat candidate_audio (or debug) as barge-in sources
+        source := ""
+        if msg.Payload != nil {
+            if v, ok := msg.Payload["source"].(string); ok { source = v }
+        }
         dec := s.fsm.OnVADStart(msg.TsMs)
-        if dec.ShouldStop && !s.stopping {
+        if (source == "candidate_audio" || source == "debug") && dec.ShouldStop && !s.stopping {
             s.stopping = true
             cmdID := uuid.New().String()
             s.pendingCmdID = cmdID

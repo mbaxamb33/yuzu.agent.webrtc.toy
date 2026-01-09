@@ -29,10 +29,11 @@ type Server struct {
     Store    *store.Store
     Reg      *Registry
     OnMessage func(sessionID string, msg Message)
+    lastSeq  map[string]int64
 }
 
 func NewServer(cfg config.Config, st *store.Store, reg *Registry) *Server {
-    return &Server{Cfg: cfg, Store: st, Reg: reg}
+    return &Server{Cfg: cfg, Store: st, Reg: reg, lastSeq: make(map[string]int64)}
 }
 
 func (s *Server) HandleWorkerWS(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +73,7 @@ func (s *Server) HandleWorkerWS(w http.ResponseWriter, r *http.Request) {
         s.Store.AppendEvent(sessionID, "worker_replaced", nil)
     }
     s.Store.AppendEvent(sessionID, "worker_connected", nil)
+    s.lastSeq[sessionID] = 0
 
     ctx := r.Context()
     for {
@@ -94,6 +96,12 @@ func (s *Server) HandleWorkerWS(w http.ResponseWriter, r *http.Request) {
         if msg.CommandID != "" { payload["command_id"] = msg.CommandID }
         if msg.UtteranceID != "" { payload["utterance_id"] = msg.UtteranceID }
         s.Store.AppendEvent(sessionID, msg.Type, payload)
+        // Sequence gap detection
+        prev := s.lastSeq[sessionID]
+        if msg.Seq > prev+1 && prev != 0 {
+            s.Store.AppendEvent(sessionID, "worker_seq_gap", map[string]any{"prev": prev, "now": msg.Seq, "gap": msg.Seq - prev})
+        }
+        if msg.Seq > prev { s.lastSeq[sessionID] = msg.Seq }
         if s.OnMessage != nil {
             s.OnMessage(sessionID, msg)
         }

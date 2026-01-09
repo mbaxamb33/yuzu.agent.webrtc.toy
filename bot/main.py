@@ -6,6 +6,9 @@ import json
 import struct
 import asyncio
 import urllib.parse
+import threading
+import webrtcvad
+import numpy as np
 
 def log(msg, **kwargs):
     payload = {"msg": msg}
@@ -67,6 +70,104 @@ def resample_to_48k(pcm_int16, sr):
     y = np.interp(new_idx, old_idx, x)
     y_int16 = np.clip(y * 32768.0, -32768, 32767).astype(np.int16)
     return y_int16
+
+class VADState:
+    def __init__(self, aggressiveness=2, frame_ms=20, hangover_ms=400):
+        self.vad = webrtcvad.Vad(aggressiveness)
+        self.frame_ms = frame_ms
+        self.hangover_frames = int(hangover_ms / frame_ms)
+        self.speaking = False
+        self.consec_speech = 0
+        self.non_speech = 0
+        self.started_at_ms = 0
+        self.min_start_frames = 2  # ~40ms
+        self.min_burst_frames = 6  # ~120ms
+
+    def process_frame(self, pcm16_bytes, sample_rate):
+        is_speech = False
+        try:
+            is_speech = self.vad.is_speech(pcm16_bytes, sample_rate)
+        except Exception:
+            is_speech = False
+        now_ms = int(time.time()*1000)
+        if not self.speaking:
+            if is_speech:
+                self.consec_speech += 1
+                if self.consec_speech >= self.min_start_frames:
+                    # start
+                    self.speaking = True
+                    self.started_at_ms = now_ms
+                    self.non_speech = 0
+                    return 'start', now_ms
+            else:
+                self.consec_speech = 0
+            return None, None
+        else:
+            if is_speech:
+                self.non_speech = 0
+                return None, None
+            else:
+                self.non_speech += 1
+                if self.non_speech >= self.hangover_frames:
+                    # end
+                    dur_frames = int((now_ms - self.started_at_ms) / self.frame_ms)
+                    self.speaking = False
+                    self.consec_speech = 0
+                    self.non_speech = 0
+                    # ignore very short bursts
+                    if dur_frames < self.min_burst_frames:
+                        return None, None
+                    return 'end', now_ms
+                return None, None
+
+def attach_candidate_vad(transport, ws_queue, session_id):
+    # Try to hook remote audio frames. Expected callback signature:
+    #   on_remote_audio(pcm16_bytes: bytes, sample_rate: int, channels: int)
+    vad = VADState(aggressiveness=int(os.environ.get('WORKER_VAD_AGGRESSIVENESS','2')),
+                   frame_ms=20, hangover_ms=400)
+    frame_bytes = int(48000 * 0.02) * 2  # 20ms @48k, 16-bit mono
+    buf = bytearray()
+
+    loop = asyncio.get_event_loop()
+
+    def handle_frame(pcm_bytes, sample_rate=48000, channels=1):
+        nonlocal buf
+        # force mono 48k PCM16
+        pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if channels == 2:
+            pcm_arr = pcm_arr.reshape(-1,2).mean(axis=1).astype(np.int16)
+        if sample_rate != 48000:
+            pcm_arr = resample_to_48k(pcm_arr, sample_rate)
+        b = pcm_arr.tobytes()
+        buf.extend(b)
+        # 20ms frames
+        while len(buf) >= frame_bytes:
+            frame = bytes(buf[:frame_bytes])
+            del buf[:frame_bytes]
+            ev, ts = vad.process_frame(frame, 48000)
+            if ev == 'start':
+                evt = {"type":"vad_start","ts_ms":ts,"session_id":session_id or "","payload":{"source":"candidate_audio"}}
+                loop.call_soon_threadsafe(asyncio.create_task, ws_queue.put(evt))
+            elif ev == 'end':
+                evt = {"type":"vad_end","ts_ms":ts,"session_id":session_id or "","payload":{"source":"candidate_audio"}}
+                loop.call_soon_threadsafe(asyncio.create_task, ws_queue.put(evt))
+
+    # Try to register callback on transport
+    if hasattr(transport, 'on_remote_audio'):
+        try:
+            transport.on_remote_audio = handle_frame
+            print("CANDIDATE_AUDIO_FRAMES hook=on_remote_audio", flush=True)
+            return
+        except Exception as e:
+            eprint("hook on_remote_audio failed:", e)
+    if hasattr(transport, 'add_remote_audio_callback'):
+        try:
+            transport.add_remote_audio_callback(handle_frame)
+            print("CANDIDATE_AUDIO_FRAMES hook=add_remote_audio_callback", flush=True)
+            return
+        except Exception as e:
+            eprint("hook add_remote_audio_callback failed:", e)
+    print("CANDIDATE_AUDIO_RX_UNAVAILABLE", flush=True)
 
 def pace_and_send_audio_pcm16(transport, pcm16_bytes, sr):
     # 20ms frames for 16-bit mono PCM
@@ -136,6 +237,8 @@ def main():
     ws_task = None
     ws_queue = asyncio.Queue()
     stop_flag = {"stop": False}
+    # Track last seen command ids for idempotent acks (optional)
+    seen_cmd_ids = set()
 
     async def ws_client():
         if not ws_url:
@@ -161,7 +264,8 @@ def main():
                         # signal playback stop
                         stop_flag["stop"] = True
                         # ack
-                        ack = {"type":"cmd_ack","ts_ms":int(time.time()*1000),"session_id":session_id or "","seq":seq,"command_id":msg.get("command_id"),"payload":{"ack":True,"error":""}}
+                        cmd_id = msg.get("command_id")
+                        ack = {"type":"cmd_ack","ts_ms":int(time.time()*1000),"session_id":session_id or "","seq":seq,"command_id":cmd_id,"payload":{"ack":True,"error":""}}
                         seq += 1
                         await ws.send(json.dumps(ack))
             # Writer loop for events from playback
@@ -185,13 +289,20 @@ def main():
         log("BOT_JOINED")
     except Exception as e:
         eprint("join failed:", e)
-        log("BOT_EXIT")
-        sys.exit(1)
+    log("BOT_EXIT")
+    sys.exit(1)
+
+    # Candidate audio VAD wiring
+    try:
+        attach_candidate_vad(transport, ws_queue, session_id)
+    except Exception as e:
+        eprint("candidate audio hook unavailable:", e)
+        # Continue; VAD may be added later
 
     # TTS
     log("TTS_START")
-    try:
-        wav_bytes = fetch_tts_wav(eleven_api_key, voice_id, phrase)
+        try:
+            wav_bytes = fetch_tts_wav(eleven_api_key, voice_id, phrase)
         pcm_arr, sr_in, ch = decode_wav_pcm16(wav_bytes)
         # Force mono 48k PCM16
         pcm_arr_48k = resample_to_48k(pcm_arr, sr_in)
