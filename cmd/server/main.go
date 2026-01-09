@@ -16,6 +16,7 @@ import (
     "yuzu/agent/internal/bot"
     "yuzu/agent/internal/config"
     "yuzu/agent/internal/daily"
+    "yuzu/agent/internal/loop"
     "yuzu/agent/internal/store"
     "yuzu/agent/internal/workerws"
 )
@@ -43,13 +44,16 @@ func main() {
 		st.SetBotPID(sessionID, pid)
 	})
 
-    h := api.NewHandlers(cfg, st, dailyClient, runner)
-    mux := http.NewServeMux()
-    mux.Handle("/", api.NewRouter(h))
-    // WS worker route
-    reg := workerws.NewRegistry()
-    wss := workerws.NewServer(cfg, st, reg)
-    mux.HandleFunc("/ws/worker", wss.HandleWorkerWS)
+	h := api.NewHandlers(cfg, st, dailyClient, runner)
+	mux := http.NewServeMux()
+	mux.Handle("/", api.NewRouter(h))
+	// WS worker route
+	reg := workerws.NewRegistry()
+	wss := workerws.NewServer(cfg, st, reg)
+	// Dispatcher for Loop A floor control
+	disp := loop.New(reg, st, 60)
+	wss.OnMessage = disp.OnMessage
+	mux.HandleFunc("/ws/worker", wss.HandleWorkerWS)
 
 	addr := ":" + cfg.Server.Port
 	srv := &http.Server{

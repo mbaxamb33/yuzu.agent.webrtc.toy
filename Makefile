@@ -17,6 +17,7 @@ help:
 	@echo "  make tidy     - Sync go.mod/go.sum"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make smoke1   - Run smoke test script (requires server running)"
+	@echo "  make smoke2   - Run barge-in smoke test (requires server running)"
 
 server:
 	$(GO) run $(SERVER_PKG)
@@ -43,3 +44,7 @@ clean:
 .PHONY: smoke1
 smoke1:
 	bash scripts/smoke_part1.sh
+
+.PHONY: smoke2
+smoke2:
+	bash scripts/smoke_part2.sh

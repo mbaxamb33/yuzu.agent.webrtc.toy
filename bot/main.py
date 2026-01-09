@@ -4,6 +4,8 @@ import sys
 import time
 import json
 import struct
+import asyncio
+import urllib.parse
 
 def log(msg, **kwargs):
     payload = {"msg": msg}
@@ -121,6 +123,63 @@ def main():
     stay_s = int(os.environ.get("BOT_STAY_CONNECTED_SECONDS", "30"))
 
     log("BOT_JOINING")
+    # Optional WS connect
+    ws_url = os.environ.get("WS_URL", "")
+    worker_token = os.environ.get("WORKER_TOKEN", "")
+    session_id = None
+    if ws_url:
+        try:
+            qs = urllib.parse.urlparse(ws_url).query
+            session_id = urllib.parse.parse_qs(qs).get("session_id", [None])[0]
+        except Exception:
+            session_id = None
+    ws_task = None
+    ws_queue = asyncio.Queue()
+    stop_flag = {"stop": False}
+
+    async def ws_client():
+        if not ws_url:
+            return
+        import websockets
+        headers = {}
+        if worker_token:
+            headers["Authorization"] = f"Bearer {worker_token}"
+        async with websockets.connect(ws_url, extra_headers=headers) as ws:
+            seq = 1
+            # worker_hello
+            hello = {"type":"worker_hello","ts_ms":int(time.time()*1000),"session_id":session_id or "","seq":seq,"payload":{"version":"p1","transport":"pipecat","audio_format":"pcm16_48k_mono"}}
+            seq += 1
+            await ws.send(json.dumps(hello))
+            # Reader loop
+            async def reader():
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if msg.get("type") == "stop_tts":
+                        # signal playback stop
+                        stop_flag["stop"] = True
+                        # ack
+                        ack = {"type":"cmd_ack","ts_ms":int(time.time()*1000),"session_id":session_id or "","seq":seq,"command_id":msg.get("command_id"),"payload":{"ack":True,"error":""}}
+                        seq += 1
+                        await ws.send(json.dumps(ack))
+            # Writer loop for events from playback
+            async def writer():
+                while True:
+                    e = await ws_queue.get()
+                    e["seq"] = seq
+                    seq += 1
+                    await ws.send(json.dumps(e))
+            await asyncio.gather(reader(), writer())
+
+    if ws_url:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        ws_task = loop.create_task(ws_client())
     try:
         transport = try_join_daily(room_url, token)
         log("BOT_JOINED")
@@ -138,8 +197,40 @@ def main():
         pcm_arr_48k = resample_to_48k(pcm_arr, sr_in)
         pcm16_bytes = pcm_arr_48k.tobytes()
         log("TTS_DONE")
+        # WS: tts_started
+        utterance_id = f"u-{int(time.time()*1000)}"
+        if ws_url:
+            evt = {"type":"tts_started","ts_ms":int(time.time()*1000),"session_id":session_id or "","command_id":"","utterance_id":utterance_id,"payload":{"source":"worker_local","text_chars":len(phrase)}}
+            loop.create_task(ws_queue.put(evt))
         try:
-            pace_and_send_audio_pcm16(transport, pcm16_bytes, 48000)
+            # paced playback with stop support
+            bytes_per_sample = 2
+            samples_per_frame = int(48000 * 0.02)
+            bytes_per_frame = samples_per_frame * bytes_per_sample
+            pos = 0
+            sent_frames = 0
+            started_ms = int(time.time()*1000)
+            while pos < len(pcm16_bytes):
+                if stop_flag["stop"]:
+                    break
+                chunk = pcm16_bytes[pos:pos+bytes_per_frame]
+                pos += bytes_per_frame
+                if hasattr(transport, 'send_audio_pcm16'):
+                    transport.send_audio_pcm16(chunk, sample_rate=48000)
+                else:
+                    transport.send_audio(chunk, sample_rate=48000)
+                sent_frames += 1
+                time.sleep(0.02)
+            duration_ms = int(time.time()*1000) - started_ms
+            log(f"AUDIO_FORMAT sr=48000 channels=1 width=2 frame_ms=20 samples_per_frame={samples_per_frame}")
+            log(f"PUBLISHED_AUDIO_FRAMES={sent_frames}")
+            log(f"AUDIO_SENT_MS={duration_ms}")
+            log(f"TRANSPORT_METHOD={'send_audio_pcm16' if hasattr(transport,'send_audio_pcm16') else 'send_audio'}")
+            # WS: tts_stopped
+            reason = "completed" if not stop_flag["stop"] else "interrupted"
+            if ws_url:
+                evt = {"type":"tts_stopped","ts_ms":int(time.time()*1000),"session_id":session_id or "","utterance_id":utterance_id,"payload":{"source":"worker_local","reason":reason}}
+                loop.create_task(ws_queue.put(evt))
         except Exception as e:
             eprint("publish error:", e)
             log("BOT_ERROR {\"stage\":\"publish\",\"error\":\"send failed\"}")
@@ -158,7 +249,7 @@ def main():
 
     log("BOT_EXIT")
 
-if __name__ == "__main__":
+    if __name__ == "__main__":
     try:
         main()
     except Exception as e:

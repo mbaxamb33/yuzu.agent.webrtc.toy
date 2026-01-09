@@ -28,6 +28,7 @@ type Server struct {
     Cfg      config.Config
     Store    *store.Store
     Reg      *Registry
+    OnMessage func(sessionID string, msg Message)
 }
 
 func NewServer(cfg config.Config, st *store.Store, reg *Registry) *Server {
@@ -93,6 +94,9 @@ func (s *Server) HandleWorkerWS(w http.ResponseWriter, r *http.Request) {
         if msg.CommandID != "" { payload["command_id"] = msg.CommandID }
         if msg.UtteranceID != "" { payload["utterance_id"] = msg.UtteranceID }
         s.Store.AppendEvent(sessionID, msg.Type, payload)
+        if s.OnMessage != nil {
+            s.OnMessage(sessionID, msg)
+        }
     }
     _ = c.Close(ws.StatusNormalClosure, "done")
     s.Reg.Remove(sessionID)
