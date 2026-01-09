@@ -184,6 +184,28 @@ func (h *Handlers) HandleMintWorkerToken(w http.ResponseWriter, r *http.Request,
     if err := json.NewEncoder(w).Encode(map[string]any{"token": tok, "exp_unix": exp}); err != nil { log.Printf("encode error: %v", err) }
 }
 
+// Dev-only: WS URL + token in one shot
+func (h *Handlers) HandleMintWSCreds(w http.ResponseWriter, r *http.Request, id string) {
+    if !h.devAuthorized(r) {
+        http.Error(w, "forbidden", http.StatusForbidden)
+        return
+    }
+    if h.cfg.Worker.TokenSecret == "" {
+        http.Error(w, "worker token not configured", http.StatusBadRequest)
+        return
+    }
+    if h.store.GetSession(id) == nil {
+        http.Error(w, "unknown session", http.StatusNotFound)
+        return
+    }
+    exp := time.Now().Add(time.Duration(h.cfg.Worker.TokenTTLSecs) * time.Second).Unix()
+    tok, err := auth.GenerateWorkerToken(h.cfg.Worker.TokenSecret, id, exp)
+    if err != nil { http.Error(w, err.Error(), http.StatusInternalServerError); return }
+    wsURL := "ws://" + r.Host + "/ws/worker?session_id=" + id
+    w.Header().Set("Content-Type", "application/json")
+    if err := json.NewEncoder(w).Encode(map[string]any{"ws_url": wsURL, "worker_token": tok, "exp_unix": exp}); err != nil { log.Printf("encode error: %v", err) }
+}
+
 // Dev-only: inject VAD start/end
 func (h *Handlers) HandleDebugVAD(w http.ResponseWriter, r *http.Request, id string, typ string) {
     if !h.devAuthorized(r) {

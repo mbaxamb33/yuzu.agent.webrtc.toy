@@ -63,9 +63,11 @@ func (d *Dispatcher) OnMessage(sessionID string, msg workerws.Message) {
         s.fsm.OnTTSStopped(msg.UtteranceID, msg.TsMs, reason)
         // If interrupted, compute latency
         if reason == "interrupted" && s.lastVADTsMs > 0 {
-            ms := msg.TsMs - s.lastVADTsMs
-            d.store.AppendEvent(sessionID, "barge_in_latency_ms", map[string]any{
-                "ms": ms, "utterance_id": msg.UtteranceID, "vad_ts_ms": s.lastVADTsMs, "tts_stop_ts_ms": msg.TsMs,
+            workerMs := msg.TsMs - s.lastVADTsMs
+            backendMs := nowRecvMs - s.lastVADRecvMs
+            d.store.AppendEvent(sessionID, "barge_in_latency", map[string]any{
+                "worker_ms": workerMs, "backend_ms": backendMs,
+                "utterance_id": msg.UtteranceID, "vad_ts_ms": s.lastVADTsMs, "tts_stop_ts_ms": msg.TsMs,
                 "recv_vad_ms": s.lastVADRecvMs, "recv_tts_stop_ms": nowRecvMs,
             })
         }

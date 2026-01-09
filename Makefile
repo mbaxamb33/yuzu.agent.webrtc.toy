@@ -18,6 +18,7 @@ help:
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make smoke1   - Run smoke test script (requires server running)"
 	@echo "  make smoke2   - Run barge-in smoke test (requires server running)"
+	@echo "  make smoke2_real - Run real-VAD barge-in smoke test (requires VAD)"
 
 server:
 	$(GO) run $(SERVER_PKG)
@@ -48,3 +49,7 @@ smoke1:
 .PHONY: smoke2
 smoke2:
 	bash scripts/smoke_part2.sh
+
+.PHONY: smoke2_real
+smoke2_real:
+	bash scripts/smoke_part2_real.sh

@@ -67,6 +67,10 @@ func NewRouter(h *Handlers) http.Handler {
             if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
             h.HandleMintWorkerToken(w, r, id)
             return
+        case "ws-creds":
+            if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+            h.HandleMintWSCreds(w, r, id)
+            return
         case "debug":
             if len(parts) < 3 { http.NotFound(w, r); return }
             action := parts[2]

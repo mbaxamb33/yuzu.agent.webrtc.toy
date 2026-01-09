@@ -13,9 +13,7 @@ echo "room_url:   $room_url"
 echo "Starting bot..." >&2
 curl -s -X POST "$BASE_URL/sessions/$session_id/start" >/dev/null
 
-echo "Pre-VAD mode: triggering debug/vad-start after 2s..." >&2
-sleep 2
-curl -s -X POST "$BASE_URL/sessions/$session_id/debug/vad-start" >/dev/null || true
+echo "Real-VAD mode: join the room and speak over the bot." >&2
 
 deadline=$(( $(date +%s) + 180 ))
 seen_vad=0
@@ -31,11 +29,12 @@ while [ $(date +%s) -lt $deadline ]; do
   grep -q '"barge_in_latency"' <<< "$events" && seen_latency=1 || true
 
   if [ $seen_vad -eq 1 ] && [ $seen_stop -eq 1 ] && [ $seen_tts_interrupted -eq 1 ] && [ $seen_latency -eq 1 ]; then
-    echo "Barge-in flow observed" >&2
+    echo "Barge-in flow observed (real VAD)" >&2
     exit 0
   fi
   sleep 2
 done
 
-echo "Timeout waiting for vad_start/stop_tts_sent/tts_stopped(interrupted)/barge_in_latency" >&2
+echo "Timeout waiting for real VAD barge-in sequence" >&2
 exit 1
+
