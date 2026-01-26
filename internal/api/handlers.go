@@ -97,14 +97,28 @@ func (h *Handlers) HandleStartSession(w http.ResponseWriter, r *http.Request, id
 	}
 	h.store.AppendEvent(id, "bot_start_requested", nil)
 
-	env := map[string]string{
-		"DAILY_ROOM_URL":             sess.RoomURL,
-		"DAILY_TOKEN":                sess.BotToken,
-		"ELEVENLABS_API_KEY":         h.cfg.Eleven.APIKey,
-		"ELEVENLABS_VOICE_ID":        h.cfg.Eleven.VoiceID,
-		"ELEVENLABS_CANNED_PHRASE":   h.cfg.Eleven.CannedPhrase,
-		"BOT_STAY_CONNECTED_SECONDS": h.cfg.Bot.StayConnectedSeconds,
-	}
+    env := map[string]string{
+        "DAILY_ROOM_URL":             sess.RoomURL,
+        "DAILY_TOKEN":                sess.BotToken,
+        "ELEVENLABS_API_KEY":         h.cfg.Eleven.APIKey,
+        "ELEVENLABS_VOICE_ID":        h.cfg.Eleven.VoiceID,
+        "ELEVENLABS_CANNED_PHRASE":   h.cfg.Eleven.CannedPhrase,
+        "BOT_STAY_CONNECTED_SECONDS": h.cfg.Bot.StayConnectedSeconds,
+    }
+    // Wire backend WS for control messages (stop_tts) if configured
+    if h.cfg.Worker.TokenSecret != "" {
+        exp := time.Now().Add(time.Duration(h.cfg.Worker.TokenTTLSecs) * time.Second).Unix()
+        tok, err := auth.GenerateWorkerToken(h.cfg.Worker.TokenSecret, id, exp)
+        if err == nil {
+            scheme := "ws"
+            if r.TLS != nil { scheme = "wss" }
+            wsURL := scheme + "://" + r.Host + "/ws/worker?session_id=" + id
+            env["WS_URL"] = wsURL
+            env["WORKER_TOKEN"] = tok
+        } else {
+            log.Printf("mint worker token failed: %v", err)
+        }
+    }
 	if err := h.runner.Start(id, env); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

@@ -130,13 +130,21 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
     """Register a candidate-audio VAD callback; bridge to asyncio with call_soon_threadsafe."""
     frame_bytes = int(48000 * 0.02) * 2  # 20ms @48k, 16-bit mono
     buf = bytearray()
+    frame_count = [0]  # Use list for nonlocal mutation in nested function
 
     def handle_frame(pcm_bytes, sample_rate=48000, channels=1):
         nonlocal buf
+        frame_count[0] += 1
+        # Log every 500 frames (~10 seconds) to confirm we're receiving audio
+        if frame_count[0] == 1:
+            print(f"REMOTE_AUDIO_RECEIVING first_frame len={len(pcm_bytes)} sr={sample_rate} ch={channels}", flush=True)
+        elif frame_count[0] % 500 == 0:
+            print(f"REMOTE_AUDIO_FRAMES_RECEIVED={frame_count[0]}", flush=True)
+        # Decode remote audio frames as PCM16 (Daily VirtualSpeaker yields int16)
         pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
-        if channels == 2:
+        if channels == 2 and pcm_arr.size % 2 == 0:
             pcm_arr = pcm_arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
-        if sample_rate != 48000:
+        if sample_rate != 48000 and pcm_arr.size > 0:
             pcm_arr = resample_to_48k(pcm_arr, sample_rate)
         b = pcm_arr.tobytes()
         buf.extend(b)
@@ -149,8 +157,31 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                 loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
                 # Local-stop: if speaking, trigger immediate stop
                 state['last_vad_ts_ms'] = ts
-                if state.get('local_stop_enabled', True) and state.get('speaking'):
-                    stop_event.set()
+                # Energy gate and guard time
+                try:
+                    frm_arr = np.frombuffer(frame, dtype=np.int16)
+                    rms = float(np.sqrt(np.mean((frm_arr.astype(np.float64))**2))) if frm_arr.size > 0 else 0.0
+                except Exception:
+                    rms = 0.0
+                guard_ok = False
+                try:
+                    armed_ts = int(state.get('speaking_armed_ts_ms', 0) or 0)
+                    guard_ms = int(state.get('local_stop_guard_ms', 0) or 0)
+                    now_ms = int(time.time() * 1000)
+                    guard_ok = (armed_ts > 0) and (now_ms - armed_ts >= guard_ms)
+                except Exception:
+                    guard_ok = True
+                min_rms = float(state.get('local_stop_min_rms', 0) or 0)
+                if state.get('local_stop_enabled', True) and state.get('speaking_armed', False) and guard_ok and rms >= min_rms:
+                    # Schedule stop on the asyncio loop thread; thread-safe
+                    try:
+                        loop.call_soon_threadsafe(stop_event.set)
+                    except Exception:
+                        # Fallback (non-thread-safe) in case loop reference is invalid
+                        try:
+                            stop_event.set()
+                        except Exception:
+                            pass
             elif ev == 'end':
                 evt = {"type": "vad_end", "ts_ms": ts, "session_id": session_id or "", "payload": {"source": "candidate_audio"}}
                 loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
@@ -198,6 +229,9 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
             else:
                 raise RuntimeError('transport has no audio send method')
             sent_frames += 1
+            if sent_frames == 1:
+                state['speaking_armed'] = True
+                state['speaking_armed_ts_ms'] = int(time.time() * 1000)
         except Exception as e:
             eprint("publish error:", e)
             raise
@@ -224,6 +258,8 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
         evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
         state['tts_stop_emitted'] = True
         await ws_queue.put(evt)
+    # Disarm after playback completes
+    state['speaking_armed'] = False
 
 
 class WavStreamParser:
@@ -469,6 +505,8 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 sent_frames += 1
                 if sent_frames == 1:
                     log(f"DEBUG: first frame sent to transport, len={len(frm)}")
+                    state['speaking_armed'] = True
+                    state['speaking_armed_ts_ms'] = int(time.time() * 1000)
                 if not first_audio_emitted:
                     first_audio_emitted = True
                     if session_id:
@@ -496,7 +534,9 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             payload = {"source": "worker_local", "reason": reason}
             vad_ts = state.get('last_vad_ts_ms')
             if reason == 'interrupted' and isinstance(vad_ts, (int, float)) and vad_ts > 0:
-                payload['barge_in_ms'] = max(0, now_ts - int(vad_ts))
+                barge_in_ms = max(0, now_ts - int(vad_ts))
+                payload['barge_in_ms'] = barge_in_ms
+                log(f"*** BARGE-IN DETECTED *** latency={barge_in_ms}ms (VAD -> playback stop)")
             evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
             state['tts_stop_emitted'] = True
             await ws_queue.put(evt)
@@ -518,6 +558,8 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             evt = {"type": "tts_queue_peak_frames", "ts_ms": now_ts, "session_id": session_id, "payload": {"peak_frames": metrics['queue_peak_frames']}}
             with contextlib.suppress(Exception):
                 await ws_queue.put(evt)
+        # Disarm local-stop after playback concludes
+        state['speaking_armed'] = False
 
 
 class DailyTransportWrapper(daily.EventHandler):
@@ -547,7 +589,8 @@ class DailyTransportWrapper(daily.EventHandler):
         self.speaker = daily.Daily.create_speaker_device(
             "bot-speaker",
             sample_rate=48000,
-            channels=1
+            channels=1,
+            non_blocking=False  # we will read frames in a background thread
         )
         daily.Daily.select_speaker_device("bot-speaker")
 
@@ -595,9 +638,31 @@ class DailyTransportWrapper(daily.EventHandler):
             })
             log("DAILY_MIC_ENABLED audio_processing=default")
 
-        # Set up speaker callback for receiving remote audio
-        if self.speaker and hasattr(self.speaker, 'set_audio_callback'):
-            self.speaker.set_audio_callback(self._on_speaker_audio)
+        # Start a background reader to pull frames from the virtual speaker
+        # and forward them into the VAD path via _on_speaker_audio.
+        def _speaker_reader():
+            try:
+                sr = getattr(self.speaker, 'sample_rate', 48000) or 48000
+                ch = getattr(self.speaker, 'channels', 1) or 1
+                num_frames = int(sr / 100) * 2  # 20ms
+                print(f"SPEAKER_READER_STARTED sr={sr} ch={ch} frames={num_frames}", flush=True)
+                while True:
+                    try:
+                        data = self.speaker.read_frames(num_frames)
+                        if data and self._remote_audio_callback:
+                            # Bridge into existing callback path
+                            self._remote_audio_callback(data, sample_rate=sr, channels=ch)
+                        else:
+                            # Back off slightly if no data
+                            time.sleep(0.005)
+                    except Exception as e:
+                        eprint(f"speaker read error: {e}")
+                        time.sleep(0.05)
+            except Exception as e:
+                eprint(f"speaker reader init error: {e}")
+
+        t = threading.Thread(target=_speaker_reader, daemon=True)
+        t.start()
 
     def _on_joined(self, data, error):
         if error:
@@ -614,6 +679,14 @@ class DailyTransportWrapper(daily.EventHandler):
         participant_id = participant.get("id", "unknown")
         log(f"PARTICIPANT_JOINED id={participant_id}")
         self._user_participant_id = participant_id
+        # Subscribe to this participant's media so the speaker reader receives audio frames
+        try:
+            self.client.update_subscriptions(participant_settings={
+                participant_id: {"media": "subscribed"}
+            })
+            log(f"SUBSCRIBED_MEDIA participant_id={participant_id}")
+        except Exception as e:
+            eprint(f"subscribe failed for {participant_id}: {e}")
         self._participant_joined_flag.set()
 
     def _check_existing_participants(self):
@@ -627,6 +700,14 @@ class DailyTransportWrapper(daily.EventHandler):
                 if not info.get("isLocal", False):
                     log(f"PARTICIPANT_ALREADY_PRESENT id={pid}")
                     self._user_participant_id = pid
+                    # Ensure subscription for already-present participant
+                    try:
+                        self.client.update_subscriptions(participant_settings={
+                            pid: {"media": "subscribed"}
+                        })
+                        log(f"SUBSCRIBED_MEDIA participant_id={pid}")
+                    except Exception as e:
+                        eprint(f"subscribe failed for {pid}: {e}")
                     self._participant_joined_flag.set()
                     return True
         except Exception as e:
@@ -766,6 +847,16 @@ async def main():
     # Shared worker state for local-stop logic (init early so WS policy can update it)
     state = {'speaking': False, 'active_utterance_id': '', 'last_vad_ts_ms': 0, 'tts_stop_emitted': False}
     state['local_stop_enabled'] = os.environ.get('LOCAL_STOP_ENABLED', 'true').lower() not in ('0', 'false', 'no')
+    # Guard to avoid barge-in before users hear anything; default 250ms
+    try:
+        state['local_stop_guard_ms'] = int(os.environ.get('LOCAL_STOP_GUARD_MS', '250'))
+    except Exception:
+        state['local_stop_guard_ms'] = 250
+    # Minimum RMS (0-32767) to accept VAD start as real speech; default 800
+    try:
+        state['local_stop_min_rms'] = int(os.environ.get('LOCAL_STOP_MIN_RMS', '800'))
+    except Exception:
+        state['local_stop_min_rms'] = 800
 
     ws_task = None
     if ws_url:
@@ -806,7 +897,13 @@ async def main():
     log("DEBUG: setting speaking state")
     speaking = True
     state['speaking'] = True
-    vad.min_start_frames = 1  # while TTS is active
+    state['speaking_armed'] = False  # only arm after first audio is sent
+    # Require multiple consecutive speech frames while TTS is active to reduce false positives
+    try:
+        vad_start_frames_during_tts = int(os.environ.get('WORKER_VAD_MIN_START_FRAMES_WHILE_TTS', '3'))
+    except Exception:
+        vad_start_frames_during_tts = 3
+    vad.min_start_frames = max(1, vad_start_frames_during_tts)
     utterance_id = f"u-{int(time.time()*1000)}"
     state['active_utterance_id'] = utterance_id
     state['tts_started_ts_ms'] = int(time.time() * 1000)

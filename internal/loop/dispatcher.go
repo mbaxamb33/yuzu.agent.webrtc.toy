@@ -28,6 +28,7 @@ type sessState struct {
     stopping      bool
     pendingCmdID  string
     ttsStartRecv  time.Time
+    bargeInArmed  bool
 }
 
 func New(reg *workerws.Registry, st *store.Store, ttsTimeoutSec int) *Dispatcher {
@@ -54,13 +55,19 @@ func (d *Dispatcher) OnMessage(sessionID string, msg workerws.Message) {
     case "tts_started":
         s.fsm.OnTTSStarted(msg.UtteranceID, msg.TsMs)
         s.ttsStartRecv = time.Now()
+        s.bargeInArmed = false
         d.store.AppendEvent(sessionID, "tts_started_backend_recv", map[string]any{"recv_ms": nowRecvMs})
+    case "tts_first_audio":
+        // Arm barge-in only after first audio is emitted, to avoid prebuffer cut-offs
+        s.bargeInArmed = true
+        d.store.AppendEvent(sessionID, "tts_first_audio_backend_recv", map[string]any{"recv_ms": nowRecvMs})
     case "tts_stopped":
         reason := ""
         if msg.Payload != nil {
             if v, ok := msg.Payload["reason"].(string); ok { reason = v }
         }
         s.fsm.OnTTSStopped(msg.UtteranceID, msg.TsMs, reason)
+        s.bargeInArmed = false
         // If interrupted, compute latency
         if reason == "interrupted" && s.lastVADTsMs > 0 {
             workerMs := msg.TsMs - s.lastVADTsMs
@@ -82,7 +89,7 @@ func (d *Dispatcher) OnMessage(sessionID string, msg workerws.Message) {
             if v, ok := msg.Payload["source"].(string); ok { source = v }
         }
         dec := s.fsm.OnVADStart(msg.TsMs)
-        if (source == "candidate_audio" || source == "debug") && dec.ShouldStop && !s.stopping {
+        if s.bargeInArmed && (source == "candidate_audio" || source == "debug") && dec.ShouldStop && !s.stopping {
             s.stopping = true
             cmdID := uuid.New().String()
             s.pendingCmdID = cmdID
