@@ -1,5 +1,7 @@
 requests==2.31.0
 numpy==1.26.4
-pipecat-ai==0.1.38
+scipy>=1.11.0
+pipecat-ai
 websockets==11.0.3
 webrtcvad==2.0.10
+daily-python>=0.10.0

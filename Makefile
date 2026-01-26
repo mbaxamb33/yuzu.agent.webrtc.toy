@@ -19,6 +19,8 @@ help:
 	@echo "  make smoke1   - Run smoke test script (requires server running)"
 	@echo "  make smoke2   - Run barge-in smoke test (requires server running)"
 	@echo "  make smoke2_real - Run real-VAD barge-in smoke test (requires VAD)"
+	@echo "  make call        - Create session, start bot, open room in browser"
+	@echo "  make health      - Check server health (requires server running)"
 
 server:
 	$(GO) run $(SERVER_PKG)
@@ -53,3 +55,11 @@ smoke2:
 .PHONY: smoke2_real
 smoke2_real:
 	bash scripts/smoke_part2_real.sh
+
+.PHONY: call
+call:
+	@bash scripts/dev_call.sh
+
+.PHONY: health
+health:
+	@curl -s http://localhost:$${PORT:-8080}/health | jq .

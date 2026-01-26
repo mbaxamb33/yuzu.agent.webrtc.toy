@@ -96,6 +96,24 @@ func (s *Server) HandleWorkerWS(w http.ResponseWriter, r *http.Request) {
         if msg.CommandID != "" { payload["command_id"] = msg.CommandID }
         if msg.UtteranceID != "" { payload["utterance_id"] = msg.UtteranceID }
         s.Store.AppendEvent(sessionID, msg.Type, payload)
+        // Handle hello -> capture capabilities and send policy
+        if msg.Type == "worker_hello" {
+            // parse local_stop_capable from payload
+            if v, ok := msg.Payload["local_stop_capable"].(bool); ok {
+                s.Store.SetLocalStopCapable(sessionID, v)
+            }
+            // Send policy if configured
+            enabled := s.Cfg.Worker.LocalStopEnabled
+            s.Store.SetLocalStopEnabled(sessionID, enabled)
+            // Respond with policy message
+            out := Message{Type: "policy", TsMs: time.Now().UnixMilli(), SessionID: sessionID, Payload: map[string]any{"local_stop_enabled": enabled}}
+            ctxSend := r.Context()
+            if err := s.Reg.SendJSON(ctxSend, sessionID, out); err != nil {
+                s.Store.AppendEvent(sessionID, "worker_policy_send_error", map[string]any{"error": err.Error()})
+            } else {
+                s.Store.AppendEvent(sessionID, "worker_policy_sent", map[string]any{"local_stop_enabled": enabled})
+            }
+        }
         // Sequence gap detection
         prev := s.lastSeq[sessionID]
         if msg.Seq > prev+1 && prev != 0 {

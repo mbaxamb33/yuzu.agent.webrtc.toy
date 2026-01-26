@@ -2,6 +2,7 @@ package main
 
 import (
     "context"
+    "encoding/json"
     "errors"
     "log"
     "net/http"
@@ -16,6 +17,7 @@ import (
     "yuzu/agent/internal/bot"
     "yuzu/agent/internal/config"
     "yuzu/agent/internal/daily"
+    "yuzu/agent/internal/health"
     "yuzu/agent/internal/loop"
     "yuzu/agent/internal/store"
     "yuzu/agent/internal/workerws"
@@ -27,8 +29,25 @@ func main() {
 
 	cfg := config.Load()
 
+	// Run startup health checks
+	log.Println("running startup health checks...")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	healthStatus := health.CheckAll(ctx, cfg)
+	cancel()
+	log.Print(healthStatus.String())
+	if !healthStatus.OK {
+		log.Println("WARNING: some health checks failed, continuing anyway...")
+	}
+
 	st := store.New()
-	dailyClient := daily.NewClient(cfg.Daily.APIKey)
+	dailyClient := daily.NewClient(cfg.Daily.APIKey, daily.AudioConfig{
+		EnableMusicMode:     cfg.Daily.EnableMusicMode,
+		AudioBitrate:        cfg.Daily.AudioBitrate,
+		EnableDTX:           cfg.Daily.EnableDTX,
+		EnablePrejoinUI:     cfg.Daily.EnablePrejoinUI,
+		EnableNetworkUI:     cfg.Daily.EnableNetworkUI,
+		EnableNoiseCancelUI: cfg.Daily.EnableNoiseCancelUI,
+	})
 
 	runner := bot.NewLocalRunner(cfg.Bot.WorkerCmd, func(sessionID string, err error) {
 		// On process exit, mark not running and append event.
@@ -56,6 +75,18 @@ func main() {
     mux.HandleFunc("/ws/worker", wss.HandleWorkerWS)
     // Wire dispatcher to REST debug endpoints
     h.SetOnWorkerMessage(disp.OnMessage)
+
+    // Health endpoint
+    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+        defer cancel()
+        status := health.CheckAll(ctx, cfg)
+        w.Header().Set("Content-Type", "application/json")
+        if !status.OK {
+            w.WriteHeader(http.StatusServiceUnavailable)
+        }
+        json.NewEncoder(w).Encode(status)
+    })
 
 	addr := ":" + cfg.Server.Port
 	srv := &http.Server{

@@ -20,6 +20,13 @@ type Config struct {
 		RoomPrivacy    string
 		BotName        string
 		BotTokenExpMin int
+		// Audio settings for high-fidelity TTS
+		EnableMusicMode     bool // Use music/full-band audio profile
+		AudioBitrate        int  // Opus bitrate in bps (e.g., 96000)
+		EnableDTX           bool // Discontinuous transmission (false for TTS)
+		EnablePrejoinUI     bool
+		EnableNetworkUI     bool
+		EnableNoiseCancelUI bool
 	}
     Bot struct {
         WorkerCmd            string
@@ -34,6 +41,7 @@ type Config struct {
         TokenSecret       string
         TokenTTLSecs      int
         TokenSkewSecs     int
+        LocalStopEnabled  bool
     }
     Floor struct {
         TTSTimeoutSeconds int
@@ -57,6 +65,12 @@ func Load() Config {
 	v.SetDefault("daily.room_privacy", "private")
 	v.SetDefault("daily.bot_name", "AI Interviewer")
 	v.SetDefault("daily.bot_token_exp_min", 720)
+	v.SetDefault("daily.enable_music_mode", true)
+	v.SetDefault("daily.audio_bitrate", 96000)
+	v.SetDefault("daily.enable_dtx", false)
+	v.SetDefault("daily.enable_prejoin_ui", true)
+	v.SetDefault("daily.enable_network_ui", true)
+	v.SetDefault("daily.enable_noise_cancel_ui", true)
 
 	v.SetDefault("bot.stay_connected_seconds", 30)
 
@@ -64,6 +78,7 @@ func Load() Config {
 
     v.SetDefault("worker.token_ttl_seconds", 1800)
     v.SetDefault("worker.token_skew_seconds", 60)
+    v.SetDefault("worker.local_stop_enabled", true)
     v.SetDefault("floor.tts_timeout_seconds", 60)
 
     v.SetDefault("dev.mode", false)
@@ -77,6 +92,12 @@ func Load() Config {
 	v.BindEnv("daily.room_privacy", "DAILY_ROOM_PRIVACY")
 	v.BindEnv("daily.bot_name", "DAILY_BOT_NAME")
 	v.BindEnv("daily.bot_token_exp_min", "DAILY_BOT_TOKEN_EXP_MIN")
+	v.BindEnv("daily.enable_music_mode", "DAILY_ENABLE_MUSIC_MODE")
+	v.BindEnv("daily.audio_bitrate", "DAILY_AUDIO_BITRATE")
+	v.BindEnv("daily.enable_dtx", "DAILY_ENABLE_DTX")
+	v.BindEnv("daily.enable_prejoin_ui", "DAILY_ENABLE_PREJOIN_UI")
+	v.BindEnv("daily.enable_network_ui", "DAILY_ENABLE_NETWORK_UI")
+	v.BindEnv("daily.enable_noise_cancel_ui", "DAILY_ENABLE_NOISE_CANCEL_UI")
 
 	v.BindEnv("bot.worker_cmd", "BOT_WORKER_CMD")
 	v.BindEnv("bot.stay_connected_seconds", "BOT_STAY_CONNECTED_SECONDS")
@@ -88,6 +109,7 @@ func Load() Config {
     v.BindEnv("worker.token_secret", "WORKER_TOKEN_SECRET")
     v.BindEnv("worker.token_ttl_seconds", "WORKER_TOKEN_TTL_SECONDS")
     v.BindEnv("worker.token_skew_seconds", "WORKER_TOKEN_SKEW_SECONDS")
+    v.BindEnv("worker.local_stop_enabled", "WORKER_LOCAL_STOP_ENABLED")
     v.BindEnv("floor.tts_timeout_seconds", "FLOOR_TTS_TIMEOUT_SECONDS")
     v.BindEnv("dev.mode", "DEV_MODE")
     v.BindEnv("dev.key", "DEV_KEY")
@@ -102,6 +124,12 @@ func Load() Config {
 	c.Daily.RoomPrivacy = v.GetString("daily.room_privacy")
 	c.Daily.BotName = v.GetString("daily.bot_name")
 	c.Daily.BotTokenExpMin = v.GetInt("daily.bot_token_exp_min")
+	c.Daily.EnableMusicMode = v.GetBool("daily.enable_music_mode")
+	c.Daily.AudioBitrate = v.GetInt("daily.audio_bitrate")
+	c.Daily.EnableDTX = v.GetBool("daily.enable_dtx")
+	c.Daily.EnablePrejoinUI = v.GetBool("daily.enable_prejoin_ui")
+	c.Daily.EnableNetworkUI = v.GetBool("daily.enable_network_ui")
+	c.Daily.EnableNoiseCancelUI = v.GetBool("daily.enable_noise_cancel_ui")
 
 	c.Bot.WorkerCmd = v.GetString("bot.worker_cmd")
 	c.Bot.StayConnectedSeconds = toString(v.Get("bot.stay_connected_seconds"))
@@ -113,6 +141,7 @@ func Load() Config {
     c.Worker.TokenSecret = v.GetString("worker.token_secret")
     c.Worker.TokenTTLSecs = v.GetInt("worker.token_ttl_seconds")
     c.Worker.TokenSkewSecs = v.GetInt("worker.token_skew_seconds")
+    c.Worker.LocalStopEnabled = v.GetBool("worker.local_stop_enabled")
     c.Floor.TTSTimeoutSeconds = v.GetInt("floor.tts_timeout_seconds")
     c.Dev.Mode = v.GetBool("dev.mode")
     c.Dev.Key = v.GetString("dev.key")

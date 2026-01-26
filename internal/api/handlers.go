@@ -48,7 +48,7 @@ func (h *Handlers) HandleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	// Create meeting token
 	exp := time.Now().Add(time.Duration(h.cfg.Daily.BotTokenExpMin) * time.Minute).Unix()
-	token, err := h.daily.CreateMeetingToken(roomName, h.cfg.Daily.BotName, exp)
+	token, err := h.daily.CreateMeetingToken(roomName, h.cfg.Daily.BotName, exp, true /* isBot */)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

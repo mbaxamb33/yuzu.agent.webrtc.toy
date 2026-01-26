@@ -11,18 +11,27 @@ import (
 var ErrSessionExists = errors.New("session already exists")
 
 type Store struct {
-	mu         sync.RWMutex
-	sessions   map[string]*types.Session
-	events     map[string][]types.Event
-	botRunning map[string]bool
+    mu         sync.RWMutex
+    sessions   map[string]*types.Session
+    events     map[string][]types.Event
+    botRunning map[string]bool
+    // worker state per session
+    workerState map[string]WorkerState
 }
 
 func New() *Store {
-	return &Store{
-		sessions:   make(map[string]*types.Session),
-		events:     make(map[string][]types.Event),
-		botRunning: make(map[string]bool),
-	}
+    return &Store{
+        sessions:   make(map[string]*types.Session),
+        events:     make(map[string][]types.Event),
+        botRunning: make(map[string]bool),
+        workerState: make(map[string]WorkerState),
+    }
+}
+
+// WorkerState captures worker capabilities and effective policy for a session.
+type WorkerState struct {
+    LocalStopCapable bool
+    LocalStopEnabled bool
 }
 
 func (s *Store) CreateSession(sess *types.Session) error {
@@ -94,11 +103,33 @@ func (s *Store) SetBotExit(sessionID string, code int, at time.Time) {
 }
 
 func (s *Store) ListSessionIDs() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]string, 0, len(s.sessions))
-	for id := range s.sessions {
-		out = append(out, id)
-	}
-	return out
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    out := make([]string, 0, len(s.sessions))
+    for id := range s.sessions {
+        out = append(out, id)
+    }
+    return out
+}
+
+// Worker state helpers
+func (s *Store) SetLocalStopCapable(sessionID string, capable bool) {
+    s.mu.Lock()
+    st := s.workerState[sessionID]
+    st.LocalStopCapable = capable
+    s.workerState[sessionID] = st
+    s.mu.Unlock()
+}
+
+func (s *Store) SetLocalStopEnabled(sessionID string, enabled bool) {
+    s.mu.Lock()
+    st := s.workerState[sessionID]
+    st.LocalStopEnabled = enabled
+    s.workerState[sessionID] = st
+    s.mu.Unlock()
+}
+
+func (s *Store) GetWorkerState(sessionID string) WorkerState {
+    s.mu.RLock(); defer s.mu.RUnlock()
+    return s.workerState[sessionID]
 }

@@ -14,7 +14,7 @@ import (
 type mockDaily struct{}
 
 func (m *mockDaily) CreateRoom(name, privacy string) error { return nil }
-func (m *mockDaily) CreateMeetingToken(roomName, userName string, exp int64) (string, error) {
+func (m *mockDaily) CreateMeetingToken(roomName, userName string, exp int64, isBot bool) (string, error) {
 	return "tok", nil
 }
 
