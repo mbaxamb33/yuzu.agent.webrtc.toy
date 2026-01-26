@@ -12,13 +12,47 @@ import threading
 import daily
 
 
-def log(msg, **kwargs):
-    payload = {"msg": msg}
-    payload.update(kwargs)
-    print(payload.get("msg"), flush=True)
+def _now_ts_ms():
+    return int(time.time() * 1000)
+
+
+def _mono_ms():
+    return int(time.monotonic() * 1000)
+
+
+def log_event(event: str, session_id: str = None, utterance_id: str = None, src: str = "worker_local", reason: str = None, metrics: dict | None = None):
+    rec = {
+        "ts_ms": _now_ts_ms(),
+        "mono_ms": _mono_ms(),
+        "event": event,
+        "src": src,
+    }
+    if session_id:
+        rec["session_id"] = session_id
+    if utterance_id:
+        rec["utterance_id"] = utterance_id
+    if reason:
+        rec["reason"] = reason
+    if metrics:
+        rec["metrics"] = metrics
+    print(json.dumps(rec), flush=True)
+
+
+def log(msg: str, **kwargs):
+    """Compat shim for legacy log() calls. Emits as a structured debug event."""
+    m = {"message": msg}
+    if kwargs:
+        m.update(kwargs)
+    log_event("debug", metrics=m)
 
 
 def eprint(*args, **kwargs):
+    # Mirror stderr to structured event for consistency
+    try:
+        msg = " ".join(str(a) for a in args)
+        log_event("stderr", reason="python_stderr", metrics={"message": msg})
+    except Exception:
+        pass
     print(*args, file=sys.stderr, **kwargs)
 
 
@@ -137,9 +171,9 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
         frame_count[0] += 1
         # Log every 500 frames (~10 seconds) to confirm we're receiving audio
         if frame_count[0] == 1:
-            print(f"REMOTE_AUDIO_RECEIVING first_frame len={len(pcm_bytes)} sr={sample_rate} ch={channels}", flush=True)
+            log_event("remote_audio_first_frame", metrics={"len": len(pcm_bytes), "sr": sample_rate, "ch": channels})
         elif frame_count[0] % 500 == 0:
-            print(f"REMOTE_AUDIO_FRAMES_RECEIVED={frame_count[0]}", flush=True)
+            log_event("remote_audio_frames_progress", metrics={"frames": frame_count[0]})
         # Decode remote audio frames as PCM16 (Daily VirtualSpeaker yields int16)
         pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
         if channels == 2 and pcm_arr.size % 2 == 0:
@@ -153,7 +187,7 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
             del buf[:frame_bytes]
             ev, ts = vad.process_frame(frame, 48000)
             if ev == 'start':
-                evt = {"type": "vad_start", "ts_ms": ts, "session_id": session_id or "", "payload": {"source": "candidate_audio"}}
+                evt = {"type": "vad_start", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
                 loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
                 # Local-stop: if speaking, trigger immediate stop
                 state['last_vad_ts_ms'] = ts
@@ -176,32 +210,33 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                     # Schedule stop on the asyncio loop thread; thread-safe
                     try:
                         loop.call_soon_threadsafe(stop_event.set)
-                    except Exception:
+                    except Exception as e1:
+                        log_event("local_stop_schedule_error", reason="call_soon_threadsafe", metrics={"error": str(e1)})
                         # Fallback (non-thread-safe) in case loop reference is invalid
                         try:
                             stop_event.set()
-                        except Exception:
-                            pass
+                        except Exception as e2:
+                            log_event("local_stop_schedule_error", reason="fallback_set", metrics={"error": str(e2)})
             elif ev == 'end':
-                evt = {"type": "vad_end", "ts_ms": ts, "session_id": session_id or "", "payload": {"source": "candidate_audio"}}
+                evt = {"type": "vad_end", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
                 loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
 
     # Try to register callback on transport
     if hasattr(transport, 'on_remote_audio'):
         try:
             transport.on_remote_audio = handle_frame
-            print("CANDIDATE_AUDIO_FRAMES hook=on_remote_audio", flush=True)
+            log_event("candidate_audio_hook_set", metrics={"method": "on_remote_audio"})
             return
         except Exception as e:
-            eprint("hook on_remote_audio failed:", e)
+            log_event("candidate_audio_hook_failed", reason="on_remote_audio", metrics={"error": str(e)})
     if hasattr(transport, 'add_remote_audio_callback'):
         try:
             transport.add_remote_audio_callback(handle_frame)
-            print("CANDIDATE_AUDIO_FRAMES hook=add_remote_audio_callback", flush=True)
+            log_event("candidate_audio_hook_set", metrics={"method": "add_remote_audio_callback"})
             return
         except Exception as e:
-            eprint("hook add_remote_audio_callback failed:", e)
-    print("CANDIDATE_AUDIO_RX_UNAVAILABLE", flush=True)
+            log_event("candidate_audio_hook_failed", reason="add_remote_audio_callback", metrics={"error": str(e)})
+    log_event("candidate_audio_rx_unavailable")
 
 
 async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, session_id, utterance_id, state):
@@ -242,10 +277,16 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
             pass
 
     duration_ms = int(time.time() * 1000) - started_ms
-    log(f"AUDIO_FORMAT sr={sr} channels=1 width=2 frame_ms=20 samples_per_frame={samples_per_frame}")
-    log(f"PUBLISHED_AUDIO_FRAMES={sent_frames}")
-    log(f"AUDIO_SENT_MS={duration_ms}")
-    log(f"TRANSPORT_METHOD={method}")
+    log_event("audio_publish_summary", metrics={
+        "sr": sr,
+        "channels": 1,
+        "width_bytes": 2,
+        "frame_ms": 20,
+        "samples_per_frame": samples_per_frame,
+        "sent_frames": sent_frames,
+        "duration_ms": duration_ms,
+        "method": method,
+    })
 
     # WS: tts_stopped (reason determined by stop_event)
     reason = "interrupted" if stop_event.is_set() else "completed"
@@ -364,18 +405,18 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
     frame_bytes_48k = int(48000 * 0.02) * 2  # 20ms @ 48kHz, 16-bit = 1920 bytes
     out_buf = bytearray()
     raw_buf = bytearray()  # Buffer for unaligned incoming bytes
-    log("DEBUG: producer HTTP request starting")
+    log_event("tts_producer_http_request_start")
     chunk_count = 0
     try:
         with requests.post(url, headers=headers, data=json.dumps(data), stream=True, timeout=30) as resp:
-            log(f"DEBUG: producer HTTP response status={resp.status_code}")
+            log_event("tts_producer_http_response", metrics={"status": resp.status_code})
             resp.raise_for_status()
             for chunk in resp.iter_content(chunk_size=4096):
                 chunk_count += 1
                 if chunk_count == 1:
-                    log(f"DEBUG: producer first chunk received, len={len(chunk)}")
+                    log_event("tts_producer_first_chunk", metrics={"len": len(chunk)})
                 if stop_flag.is_set():
-                    log("DEBUG: producer stop_flag set, breaking")
+                    log_event("tts_producer_stop_flag", metrics={"chunk_count": chunk_count})
                     break
                 if not chunk:
                     continue
@@ -392,14 +433,14 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
                 for frm in slice_frames(out_buf, frame_bytes_48k):
                     if metrics.get('first_frame_sent_ts_ms') is None:
                         metrics['first_frame_sent_ts_ms'] = int(time.time() * 1000)
-                        log("DEBUG: first frame queued")
+                        log_event("tts_producer_first_frame_queued")
                     fut = asyncio.run_coroutine_threadsafe(queue.put(frm), loop)
                     try:
                         fut.result()  # backpressure
                     except Exception as e:
-                        log(f"DEBUG: queue put failed: {e}")
+                        log_event("tts_queue_put_failed", metrics={"error": str(e)})
                         return
-            log("DEBUG: producer HTTP stream finished")
+            log_event("tts_producer_http_stream_finished")
             # Send sentinel to signal completion
             fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
             try:
@@ -407,7 +448,7 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
             except Exception:
                 pass
     except Exception as e:
-        log(f"DEBUG: producer exception: {e}")
+        log_event("tts_producer_exception", metrics={"error": str(e)})
         # Send sentinel even on error
         try:
             fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
@@ -418,39 +459,39 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
 
 async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, stop_event, ws_queue, session_id, utterance_id, state):
     """Streaming TTS end-to-end: producer + consumer with prebuffer and underrun handling."""
-    log("DEBUG: tts_streaming_play started")
+    log_event("tts_streaming_play_started", session_id=session_id or "", utterance_id=utterance_id)
     queue = asyncio.Queue(maxsize=25)  # ~500ms at 20ms frames
     frame_bytes = int(48000 * 0.02) * 2
     metrics = {'first_frame_sent_ts_ms': None, 'queue_peak_frames': 0}
     stop_flag = threading.Event()
 
     def start_producer():
-        log("DEBUG: producer starting")
+        log_event("tts_producer_start", session_id=session_id or "", utterance_id=utterance_id)
         _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, stop_flag, metrics)
-        log("DEBUG: producer finished")
+        log_event("tts_producer_finished", session_id=session_id or "", utterance_id=utterance_id)
 
     # Start producer in threadpool
-    log("DEBUG: launching producer in threadpool")
+    log_event("tts_producer_launch", session_id=session_id or "", utterance_id=utterance_id)
     prod_fut = loop.run_in_executor(None, start_producer)
 
     # Prebuffer 10-25 frames (200-500ms) to smooth network jitter
     prebuffer_target = int(os.environ.get('TTS_PREBUFFER_FRAMES', '15'))
     prebuffer_target = max(10, min(25, prebuffer_target))
     prebuffer_timeout_secs = int(os.environ.get('TTS_PREBUFFER_TIMEOUT_SECS', '30'))
-    log(f"DEBUG: waiting for prebuffer, target={prebuffer_target}, timeout={prebuffer_timeout_secs}s")
+    log_event("tts_prebuffer_wait", session_id=session_id or "", utterance_id=utterance_id, metrics={"target_frames": prebuffer_target, "timeout_s": prebuffer_timeout_secs})
     prebuffer_timeout = time.time() + prebuffer_timeout_secs
     while queue.qsize() < prebuffer_target and not stop_event.is_set():
         if time.time() > prebuffer_timeout:
-            log("DEBUG: prebuffer timeout")
+            log_event("tts_prebuffer_timeout", session_id=session_id or "", utterance_id=utterance_id)
             break
         # Check if producer finished early (peek for None sentinel)
         if not prod_fut.done():
             await asyncio.sleep(0.01)
         else:
-            log("DEBUG: producer finished during prebuffer")
+            log_event("tts_producer_finished_during_prebuffer", session_id=session_id or "", utterance_id=utterance_id)
             break
         metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], queue.qsize())
-    log(f"DEBUG: prebuffer done, queue size={queue.qsize()}")
+    log_event("tts_prebuffer_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"queue_size": queue.qsize()})
 
     # Consumer loop with monotonic timing for consistent frame rate
     sent_frames = 0
@@ -465,7 +506,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 frm = await asyncio.wait_for(queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 # True underrun - no data for 500ms during streaming
-                log("DEBUG: consumer timeout - buffer underrun")
+                log_event("tts_consumer_underrun", session_id=session_id or "", utterance_id=utterance_id)
                 reason = 'buffer_underrun'
                 if session_id and not state.get('tts_stop_emitted', False):
                     now_ts = int(time.time() * 1000)
@@ -479,7 +520,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 break
             # Check for sentinel (None) indicating producer is done
             if frm is None:
-                log("DEBUG: consumer received sentinel - stream complete")
+                log_event("tts_stream_complete", session_id=session_id or "", utterance_id=utterance_id)
                 completed_normally = True
                 break
 
@@ -504,7 +545,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                     transport.send_audio(frm, sample_rate=48000)
                 sent_frames += 1
                 if sent_frames == 1:
-                    log(f"DEBUG: first frame sent to transport, len={len(frm)}")
+                    log_event("tts_first_frame_sent", session_id=session_id or "", utterance_id=utterance_id, metrics={"len": len(frm)})
                     state['speaking_armed'] = True
                     state['speaking_armed_ts_ms'] = int(time.time() * 1000)
                 if not first_audio_emitted:
@@ -513,10 +554,11 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                         now_ts = int(time.time() * 1000)
                         tts_started_ts = state.get('tts_started_ts_ms', now_ts)
                         first_audio_ms = max(0, now_ts - int(tts_started_ts))
-                        evt = {"type": "tts_first_audio", "ts_ms": now_ts, "session_id": session_id, "payload": {"first_audio_ms": first_audio_ms}}
+                        evt = {"type": "tts_first_audio", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": {"first_audio_ms": first_audio_ms}}
                         await ws_queue.put(evt)
+                        log_event("tts_first_audio", session_id=session_id or "", utterance_id=utterance_id, metrics={"first_audio_ms": first_audio_ms})
             except Exception as e:
-                log(f"DEBUG: transport send error: {e}")
+                log_event("tts_transport_send_error", session_id=session_id or "", utterance_id=utterance_id, metrics={"error": str(e)})
                 stop_event.set()
                 break
 
@@ -536,11 +578,11 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             if reason == 'interrupted' and isinstance(vad_ts, (int, float)) and vad_ts > 0:
                 barge_in_ms = max(0, now_ts - int(vad_ts))
                 payload['barge_in_ms'] = barge_in_ms
-                log(f"*** BARGE-IN DETECTED *** latency={barge_in_ms}ms (VAD -> playback stop)")
+                log_event("barge_in_detected", session_id=session_id, utterance_id=utterance_id, metrics={"latency_ms": barge_in_ms, "path": "VAD->stop"})
             evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
             state['tts_stop_emitted'] = True
             await ws_queue.put(evt)
-        log(f"DEBUG: TTS playback done, sent_frames={sent_frames}, completed_normally={completed_normally}")
+        log_event("tts_playback_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"sent_frames": sent_frames, "completed_normally": completed_normally})
     finally:
         # Cancel producer
         stop_flag.set()
@@ -555,7 +597,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
         # Emit queue peak metric
         if session_id and metrics['queue_peak_frames'] is not None:
             now_ts = int(time.time() * 1000)
-            evt = {"type": "tts_queue_peak_frames", "ts_ms": now_ts, "session_id": session_id, "payload": {"peak_frames": metrics['queue_peak_frames']}}
+            evt = {"type": "tts_queue_peak_frames", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": {"peak_frames": metrics['queue_peak_frames']}}
             with contextlib.suppress(Exception):
                 await ws_queue.put(evt)
         # Disarm local-stop after playback concludes
@@ -624,7 +666,7 @@ class DailyTransportWrapper(daily.EventHandler):
                     }
                 }
             })
-            log("DAILY_MIC_ENABLED audio_processing=disabled")
+            log_event("daily_mic_enabled", metrics={"audio_processing": "disabled"})
         except Exception as e:
             # Fallback: enable mic without custom constraints
             eprint(f"customConstraints failed ({e}), enabling mic without them")
@@ -636,7 +678,7 @@ class DailyTransportWrapper(daily.EventHandler):
                     }
                 }
             })
-            log("DAILY_MIC_ENABLED audio_processing=default")
+            log_event("daily_mic_enabled", metrics={"audio_processing": "default"})
 
         # Start a background reader to pull frames from the virtual speaker
         # and forward them into the VAD path via _on_speaker_audio.
@@ -645,7 +687,8 @@ class DailyTransportWrapper(daily.EventHandler):
                 sr = getattr(self.speaker, 'sample_rate', 48000) or 48000
                 ch = getattr(self.speaker, 'channels', 1) or 1
                 num_frames = int(sr / 100) * 2  # 20ms
-                print(f"SPEAKER_READER_STARTED sr={sr} ch={ch} frames={num_frames}", flush=True)
+                self._speaker_read_errors = 0
+                log_event("speaker_reader_started", metrics={"sr": sr, "ch": ch, "frames_per_read": num_frames})
                 while True:
                     try:
                         data = self.speaker.read_frames(num_frames)
@@ -656,20 +699,21 @@ class DailyTransportWrapper(daily.EventHandler):
                             # Back off slightly if no data
                             time.sleep(0.005)
                     except Exception as e:
-                        eprint(f"speaker read error: {e}")
+                        self._speaker_read_errors += 1
+                        log_event("speaker_read_error", reason="read_frames", metrics={"error": str(e), "errors_total": self._speaker_read_errors})
                         time.sleep(0.05)
             except Exception as e:
-                eprint(f"speaker reader init error: {e}")
+                log_event("speaker_reader_init_error", metrics={"error": str(e)})
 
         t = threading.Thread(target=_speaker_reader, daemon=True)
         t.start()
 
     def _on_joined(self, data, error):
         if error:
-            log(f"JOIN_ERROR: {error}")
+            log_event("daily_join_error", metrics={"error": str(error)})
             return
         self._joined = True
-        log("DAILY_JOINED")
+        log_event("daily_joined")
 
     def on_participant_joined(self, participant):
         """Daily SDK event handler - called when any participant joins."""
@@ -677,14 +721,14 @@ class DailyTransportWrapper(daily.EventHandler):
         if participant.get("info", {}).get("isLocal", False):
             return
         participant_id = participant.get("id", "unknown")
-        log(f"PARTICIPANT_JOINED id={participant_id}")
+        log_event("participant_joined", metrics={"participant_id": participant_id})
         self._user_participant_id = participant_id
         # Subscribe to this participant's media so the speaker reader receives audio frames
         try:
             self.client.update_subscriptions(participant_settings={
                 participant_id: {"media": "subscribed"}
             })
-            log(f"SUBSCRIBED_MEDIA participant_id={participant_id}")
+            log_event("subscribed_media", metrics={"participant_id": participant_id})
         except Exception as e:
             eprint(f"subscribe failed for {participant_id}: {e}")
         self._participant_joined_flag.set()
@@ -698,14 +742,14 @@ class DailyTransportWrapper(daily.EventHandler):
                     continue
                 info = pdata.get("info", {})
                 if not info.get("isLocal", False):
-                    log(f"PARTICIPANT_ALREADY_PRESENT id={pid}")
+                    log_event("participant_already_present", metrics={"participant_id": pid})
                     self._user_participant_id = pid
                     # Ensure subscription for already-present participant
                     try:
                         self.client.update_subscriptions(participant_settings={
                             pid: {"media": "subscribed"}
                         })
-                        log(f"SUBSCRIBED_MEDIA participant_id={pid}")
+                        log_event("subscribed_media", metrics={"participant_id": pid})
                     except Exception as e:
                         eprint(f"subscribe failed for {pid}: {e}")
                     self._participant_joined_flag.set()
@@ -829,7 +873,7 @@ async def main():
     phrase = os.environ.get("ELEVENLABS_CANNED_PHRASE", "Hi, I'm your AI interviewer. Can you hear me clearly?")
     stay_s = int(os.environ.get("BOT_STAY_CONNECTED_SECONDS", "30"))
 
-    log("BOT_JOINING")
+    log_event("bot_joining")
 
     # Optional WS wiring
     ws_url = os.environ.get("WS_URL", "")
@@ -866,21 +910,21 @@ async def main():
     loop = asyncio.get_running_loop()
     try:
         transport = await loop.run_in_executor(None, try_join_daily, room_url, token)
-        log("BOT_JOINED")
+        log_event("bot_joined", session_id=session_id or "")
     except Exception as e:
         eprint("join failed:", e)
-        log("BOT_EXIT")
+        log_event("bot_exit")
         return
 
     # Wait for user to join before speaking
     participant_timeout = int(os.environ.get("BOT_PARTICIPANT_TIMEOUT_SECONDS", "120"))
-    log(f"BOT_WAITING_FOR_PARTICIPANT timeout={participant_timeout}s")
+    log_event("bot_waiting_for_participant", session_id=session_id or "", metrics={"timeout_s": participant_timeout})
     participant_found = await loop.run_in_executor(None, transport.wait_for_participant, participant_timeout)
     if not participant_found:
-        log("BOT_PARTICIPANT_TIMEOUT")
-        log("BOT_EXIT")
+        log_event("bot_participant_timeout", session_id=session_id or "")
+        log_event("bot_exit", session_id=session_id or "")
         return
-    log("BOT_PARTICIPANT_READY")
+    log_event("bot_participant_ready", session_id=session_id or "")
 
     # Candidate audio VAD wiring
     vad = VADState(aggressiveness=int(os.environ.get('WORKER_VAD_AGGRESSIVENESS', '2')), frame_ms=20, hangover_ms=400)
@@ -891,10 +935,10 @@ async def main():
 
     # Decide streaming vs non-streaming
     use_streaming = os.environ.get('ELEVENLABS_STREAMING', 'true').lower() not in ('0', 'false', 'no')
-    log(f"DEBUG: use_streaming={use_streaming}")
+    log_event("tts_mode", session_id=session_id or "", metrics={"streaming": use_streaming})
 
     # Emit tts_started and mark speaking
-    log("DEBUG: setting speaking state")
+    log_event("tts_setting_speaking_state", session_id=session_id or "")
     speaking = True
     state['speaking'] = True
     state['speaking_armed'] = False  # only arm after first audio is sent
@@ -916,24 +960,25 @@ async def main():
             "utterance_id": utterance_id,
             "payload": {"source": "worker_local", "text_chars": len(phrase), "streaming": use_streaming}
         })
+    log_event("tts_started", session_id=session_id or "", utterance_id=utterance_id, metrics={"text_chars": len(phrase), "streaming": use_streaming})
 
-    log("DEBUG: starting TTS playback")
+    log_event("tts_playback_start", session_id=session_id or "", utterance_id=utterance_id)
     try:
         if use_streaming:
-            log("DEBUG: using streaming TTS")
+            log_event("tts_streaming_mode", session_id=session_id or "", utterance_id=utterance_id)
             await tts_streaming_play(loop, transport, eleven_api_key, voice_id, phrase, stop_event, ws_queue, session_id, utterance_id, state)
         else:
             # Fallback: fetch-then-play
-            log("TTS_START")
+            log_event("tts_fetch_start", session_id=session_id or "", utterance_id=utterance_id)
             wav_bytes = await loop.run_in_executor(None, fetch_tts_wav, eleven_api_key, voice_id, phrase)
             pcm_arr, sr_in, _ = decode_wav_pcm16(wav_bytes)
             pcm_arr_48k = resample_to_48k(pcm_arr, sr_in)
             pcm16_bytes = pcm_arr_48k.tobytes()
-            log("TTS_DONE")
+            log_event("tts_fetch_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"bytes": len(pcm16_bytes)})
             await playback_task(transport, pcm16_bytes, 48000, stop_event, loop, ws_queue, session_id, utterance_id, state)
     except Exception:
-        log("BOT_ERROR {\"stage\":\"publish\",\"error\":\"send failed\"}")
-        log("BOT_EXIT")
+        log_event("bot_error", session_id=session_id or "", reason="publish_send_failed")
+        log_event("bot_exit", session_id=session_id or "")
         return
     finally:
         speaking = False
@@ -943,15 +988,18 @@ async def main():
         state['tts_stop_emitted'] = False
 
     # Stay connected for N seconds (async)
+    # Reduce log noise: log at start, every 10s, and last 3s
+    log_event("bot_sleep_start", session_id=session_id, metrics={"seconds": stay_s})
     for i in range(stay_s, 0, -1):
-        log(f"BOT_SLEEPING {i}")
+        if i == stay_s or i % 10 == 0 or i <= 3:
+            log_event("bot_sleeping", session_id=session_id, metrics={"seconds_left": i})
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=1.0)
             break
         except asyncio.TimeoutError:
             pass
 
-    log("BOT_EXIT")
+    log_event("bot_exit", session_id=session_id or "")
 
     # Cleanup WS task if running
     if ws_task:
@@ -967,5 +1015,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         eprint("fatal:", e)
-        print("BOT_EXIT", flush=True)
+        log_event("bot_exit")
         sys.exit(1)

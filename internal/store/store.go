@@ -52,16 +52,28 @@ func (s *Store) GetSession(id string) *types.Session {
 }
 
 func (s *Store) AppendEvent(sessionID, typ string, payload map[string]any) types.Event {
-	evt := types.Event{Type: typ, Ts: time.Now().UTC(), Payload: payload}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events[sessionID] = append(s.events[sessionID], evt)
-	// Cap total events per session to avoid unbounded growth
-	const maxEvents = 200
-	if len(s.events[sessionID]) > maxEvents {
-		s.events[sessionID] = append([]types.Event(nil), s.events[sessionID][len(s.events[sessionID])-maxEvents:]...)
-	}
-	return evt
+    evt := types.Event{Type: typ, Ts: time.Now().UTC(), Payload: payload}
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.events[sessionID] = append(s.events[sessionID], evt)
+    // Cap total events per session to avoid unbounded growth
+    const maxEvents = 200
+    if l := len(s.events[sessionID]); l > maxEvents {
+        // Keep space for a single truncation warning so the total stays at maxEvents
+        keep := maxEvents - 1
+        if keep < 0 { keep = 0 }
+        dropped := l - keep
+        if dropped < 0 { dropped = 0 }
+        if keep > 0 {
+            s.events[sessionID] = append([]types.Event(nil), s.events[sessionID][l-keep:]...)
+        } else {
+            s.events[sessionID] = []types.Event{}
+        }
+        // Append warning event
+        warn := types.Event{Type: "events_truncated", Ts: time.Now().UTC(), Payload: map[string]any{"session_id": sessionID, "dropped": dropped, "kept": keep}}
+        s.events[sessionID] = append(s.events[sessionID], warn)
+    }
+    return evt
 }
 
 func (s *Store) ListEvents(sessionID string) []types.Event {
