@@ -127,26 +127,39 @@ class VADState:
         self.min_burst_frames = 6  # ~120ms
 
     def process_frame(self, pcm16_bytes, sample_rate):
+        info = {
+            'is_speech': False,
+            'consec_speech': self.consec_speech,
+            'min_start_frames': self.min_start_frames,
+            'speaking': self.speaking,
+            'prestart': False,
+        }
         try:
             is_speech = self.vad.is_speech(pcm16_bytes, sample_rate)
         except Exception:
             is_speech = False
+        info['is_speech'] = is_speech
         now_ms = int(time.time() * 1000)
         if not self.speaking:
             if is_speech:
                 self.consec_speech += 1
+                info['consec_speech'] = self.consec_speech
                 if self.consec_speech >= self.min_start_frames:
                     self.speaking = True
                     self.started_at_ms = now_ms
                     self.non_speech = 0
-                    return 'start', now_ms
+                    info['speaking'] = True
+                    return 'start', now_ms, info
+                else:
+                    info['prestart'] = True
             else:
                 self.consec_speech = 0
-            return None, None
+                info['consec_speech'] = 0
+            return None, None, info
         else:
             if is_speech:
                 self.non_speech = 0
-                return None, None
+                return None, None, info
             else:
                 self.non_speech += 1
                 if self.non_speech >= self.hangover_frames:
@@ -155,9 +168,9 @@ class VADState:
                     self.consec_speech = 0
                     self.non_speech = 0
                     if dur_frames < self.min_burst_frames:
-                        return None, None
-                    return 'end', now_ms
-                return None, None
+                        return None, None, info
+                    return 'end', now_ms, info
+                return None, None, info
 
 
 def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event, state):
@@ -185,13 +198,34 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
         while len(buf) >= frame_bytes:
             frame = bytes(buf[:frame_bytes])
             del buf[:frame_bytes]
-            ev, ts = vad.process_frame(frame, 48000)
+            ev, ts, vinf = vad.process_frame(frame, 48000)
+            # VAD suppression counters per utterance
+            counters = state.setdefault('vad_counters', {
+                'vad_starts_total': 0,
+                'vad_stops_allowed': 0,
+                'vad_suppressed_guard': 0,
+                'vad_suppressed_energy': 0,
+                'vad_suppressed_minframes': 0,
+            })
+            # Sample RMS for environment profiling (once per ~1s while speaking)
+            now_ms = int(time.time() * 1000)
+            try:
+                frm_arr_prof = np.frombuffer(frame, dtype=np.int16)
+                rms_prof = float(np.sqrt(np.mean((frm_arr_prof.astype(np.float64))**2))) if frm_arr_prof.size > 0 else 0.0
+            except Exception:
+                rms_prof = 0.0
+            if state.get('speaking', False):
+                last_sample = state.get('rms_last_sample_ts', 0)
+                if now_ms - int(last_sample) >= 1000:
+                    state.setdefault('rms_samples', []).append(rms_prof)
+                    state['rms_last_sample_ts'] = now_ms
+
+            if vinf.get('prestart'):
+                counters['vad_suppressed_minframes'] += 1
+
             if ev == 'start':
-                evt = {"type": "vad_start", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
-                loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
-                # Local-stop: if speaking, trigger immediate stop
-                state['last_vad_ts_ms'] = ts
-                # Energy gate and guard time
+                counters['vad_starts_total'] += 1
+                # Compute RMS & gating
                 try:
                     frm_arr = np.frombuffer(frame, dtype=np.int16)
                     rms = float(np.sqrt(np.mean((frm_arr.astype(np.float64))**2))) if frm_arr.size > 0 else 0.0
@@ -201,12 +235,21 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                 try:
                     armed_ts = int(state.get('speaking_armed_ts_ms', 0) or 0)
                     guard_ms = int(state.get('local_stop_guard_ms', 0) or 0)
-                    now_ms = int(time.time() * 1000)
                     guard_ok = (armed_ts > 0) and (now_ms - armed_ts >= guard_ms)
+                    if guard_ok and not state.get('guard_elapsed_logged', False):
+                        log_event("local_stop_guard_elapsed", metrics={"guard_ms": guard_ms, "elapsed_ms": now_ms - armed_ts})
+                        state['guard_elapsed_logged'] = True
                 except Exception:
                     guard_ok = True
                 min_rms = float(state.get('local_stop_min_rms', 0) or 0)
+                payload_extra = {"rms": rms, "rms_threshold": min_rms, "guard_ok": guard_ok, "speaking_armed": state.get('speaking_armed', False), "speaking_armed_ts_ms": state.get('speaking_armed_ts_ms', 0)}
+                evt = {"type": "vad_start", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio", **payload_extra}}
+                loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
+                # Local-stop decision
+                state['last_vad_ts_ms'] = ts
                 if state.get('local_stop_enabled', True) and state.get('speaking_armed', False) and guard_ok and rms >= min_rms:
+                    counters['vad_stops_allowed'] += 1
+                    log_event("local_stop_triggered", session_id=session_id or "", utterance_id=state.get('active_utterance_id', ''), metrics=payload_extra)
                     # Schedule stop on the asyncio loop thread; thread-safe
                     try:
                         loop.call_soon_threadsafe(stop_event.set)
@@ -217,6 +260,14 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                             stop_event.set()
                         except Exception as e2:
                             log_event("local_stop_schedule_error", reason="fallback_set", metrics={"error": str(e2)})
+                else:
+                    # Suppression attribution
+                    if not guard_ok:
+                        counters['vad_suppressed_guard'] += 1
+                        log_event("vad_start_suppressed", session_id=session_id or "", utterance_id=state.get('active_utterance_id', ''), reason="guard", metrics=payload_extra)
+                    elif rms < min_rms:
+                        counters['vad_suppressed_energy'] += 1
+                        log_event("vad_start_suppressed", session_id=session_id or "", utterance_id=state.get('active_utterance_id', ''), reason="energy", metrics=payload_extra)
             elif ev == 'end':
                 evt = {"type": "vad_end", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
                 loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
@@ -548,6 +599,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                     log_event("tts_first_frame_sent", session_id=session_id or "", utterance_id=utterance_id, metrics={"len": len(frm)})
                     state['speaking_armed'] = True
                     state['speaking_armed_ts_ms'] = int(time.time() * 1000)
+                    log_event("speaking_armed", session_id=session_id or "", utterance_id=utterance_id, metrics={"speaking_armed_ts_ms": state['speaking_armed_ts_ms']})
                 if not first_audio_emitted:
                     first_audio_emitted = True
                     if session_id:
@@ -564,7 +616,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
 
             metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], queue.qsize())
             next_frame_time += frame_duration  # Schedule next frame exactly 20ms later
-        # Emit tts_stopped with appropriate reason
+        # Emit tts_stopped with appropriate reason and include VAD/RMS profiling
         if session_id and not state.get('tts_stop_emitted', False):
             now_ts = int(time.time() * 1000)
             if completed_normally:
@@ -579,6 +631,23 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 barge_in_ms = max(0, now_ts - int(vad_ts))
                 payload['barge_in_ms'] = barge_in_ms
                 log_event("barge_in_detected", session_id=session_id, utterance_id=utterance_id, metrics={"latency_ms": barge_in_ms, "path": "VAD->stop"})
+            # Attach VAD suppression counters
+            if isinstance(state.get('vad_counters'), dict):
+                payload['vad_counters'] = state['vad_counters']
+            # Attach speaking armed ts
+            if state.get('speaking_armed_ts_ms'):
+                payload['speaking_armed_ts_ms'] = int(state['speaking_armed_ts_ms'])
+            # RMS profiling percentiles
+            def _pct(values, p):
+                if not values:
+                    return 0.0
+                vv = sorted(values)
+                k = max(0, min(len(vv)-1, int(round((p/100.0)*(len(vv)-1)))))
+                return float(vv[k])
+            rms_vals = state.get('rms_samples') or []
+            if rms_vals:
+                payload['rms_p50'] = _pct(rms_vals, 50)
+                payload['rms_p90'] = _pct(rms_vals, 90)
             evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
             state['tts_stop_emitted'] = True
             await ws_queue.put(evt)
@@ -948,6 +1017,11 @@ async def main():
     except Exception:
         vad_start_frames_during_tts = 3
     vad.min_start_frames = max(1, vad_start_frames_during_tts)
+    # Reset per-utterance counters and RMS profiling
+    state['vad_counters'] = {'vad_starts_total': 0, 'vad_stops_allowed': 0, 'vad_suppressed_guard': 0, 'vad_suppressed_energy': 0, 'vad_suppressed_minframes': 0}
+    state['rms_samples'] = []
+    state['rms_last_sample_ts'] = 0
+    state['guard_elapsed_logged'] = False
     utterance_id = f"u-{int(time.time()*1000)}"
     state['active_utterance_id'] = utterance_id
     state['tts_started_ts_ms'] = int(time.time() * 1000)
