@@ -456,16 +456,24 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
     frame_bytes_48k = int(48000 * 0.02) * 2  # 20ms @ 48kHz, 16-bit = 1920 bytes
     out_buf = bytearray()
     raw_buf = bytearray()  # Buffer for unaligned incoming bytes
+    # Mark request start for timing breakdown
+    ts_now = int(time.time() * 1000)
+    metrics['tts_request_sent_ts_ms'] = ts_now
     log_event("tts_producer_http_request_start")
     chunk_count = 0
     try:
         with requests.post(url, headers=headers, data=json.dumps(data), stream=True, timeout=30) as resp:
             log_event("tts_producer_http_response", metrics={"status": resp.status_code})
+            metrics['elevenlabs_headers_ts_ms'] = int(time.time() * 1000)
             resp.raise_for_status()
+            metrics['producer_total_chunks'] = 0
+            metrics['producer_total_bytes'] = 0
             for chunk in resp.iter_content(chunk_size=4096):
                 chunk_count += 1
                 if chunk_count == 1:
                     log_event("tts_producer_first_chunk", metrics={"len": len(chunk)})
+                    metrics['elevenlabs_first_chunk_ts_ms'] = int(time.time() * 1000)
+                    metrics['producer_stream_start_ts_ms'] = metrics['elevenlabs_first_chunk_ts_ms']
                 if stop_flag.is_set():
                     log_event("tts_producer_stop_flag", metrics={"chunk_count": chunk_count})
                     break
@@ -473,6 +481,9 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
                     continue
                 # Buffer raw bytes to ensure 2-byte alignment for int16
                 raw_buf.extend(chunk)
+                # Update producer metrics
+                metrics['producer_total_chunks'] += 1
+                metrics['producer_total_bytes'] += len(chunk)
                 aligned_len = (len(raw_buf) // 2) * 2
                 if aligned_len == 0:
                     continue
@@ -492,6 +503,7 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
                         log_event("tts_queue_put_failed", metrics={"error": str(e)})
                         return
             log_event("tts_producer_http_stream_finished")
+            metrics['producer_stream_end_ts_ms'] = int(time.time() * 1000)
             # Send sentinel to signal completion
             fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
             try:
@@ -513,7 +525,13 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
     log_event("tts_streaming_play_started", session_id=session_id or "", utterance_id=utterance_id)
     queue = asyncio.Queue(maxsize=25)  # ~500ms at 20ms frames
     frame_bytes = int(48000 * 0.02) * 2
-    metrics = {'first_frame_sent_ts_ms': None, 'queue_peak_frames': 0}
+    metrics = {
+        'first_frame_sent_ts_ms': None,
+        'queue_peak_frames': 0,
+        'queue_sum': 0,
+        'queue_samples': 0,
+        'underruns': 0,
+    }
     stop_flag = threading.Event()
 
     def start_producer():
@@ -543,6 +561,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             break
         metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], queue.qsize())
     log_event("tts_prebuffer_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"queue_size": queue.qsize()})
+    metrics['prebuffer_done_ts_ms'] = int(time.time() * 1000)
 
     # Consumer loop with monotonic timing for consistent frame rate
     sent_frames = 0
@@ -550,6 +569,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
     completed_normally = False
     frame_duration = 0.02  # 20ms per frame
     next_frame_time = time.monotonic()
+    send_start_mono = None
 
     try:
         while not stop_event.is_set():
@@ -558,6 +578,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             except asyncio.TimeoutError:
                 # True underrun - no data for 500ms during streaming
                 log_event("tts_consumer_underrun", session_id=session_id or "", utterance_id=utterance_id)
+                metrics['underruns'] = metrics.get('underruns', 0) + 1
                 reason = 'buffer_underrun'
                 if session_id and not state.get('tts_stop_emitted', False):
                     now_ts = int(time.time() * 1000)
@@ -600,6 +621,18 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                     state['speaking_armed'] = True
                     state['speaking_armed_ts_ms'] = int(time.time() * 1000)
                     log_event("speaking_armed", session_id=session_id or "", utterance_id=utterance_id, metrics={"speaking_armed_ts_ms": state['speaking_armed_ts_ms']})
+                    metrics['first_frame_sent_ts_ms'] = int(time.time() * 1000)
+                    # Emit timing breakdown once on first frame sent
+                    breakdown = {
+                        "tts_started_ts_ms": state.get('tts_started_ts_ms'),
+                        "tts_request_sent_ts_ms": metrics.get('tts_request_sent_ts_ms'),
+                        "elevenlabs_headers_ts_ms": metrics.get('elevenlabs_headers_ts_ms'),
+                        "elevenlabs_first_chunk_ts_ms": metrics.get('elevenlabs_first_chunk_ts_ms'),
+                        "prebuffer_done_ts_ms": metrics.get('prebuffer_done_ts_ms'),
+                        "first_frame_sent_ts_ms": metrics.get('first_frame_sent_ts_ms'),
+                    }
+                    log_event("tts_timing_breakdown", session_id=session_id or "", utterance_id=utterance_id, metrics=breakdown)
+                    send_start_mono = time.monotonic()
                 if not first_audio_emitted:
                     first_audio_emitted = True
                     if session_id:
@@ -614,7 +647,10 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 stop_event.set()
                 break
 
-            metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], queue.qsize())
+            qsz = queue.qsize()
+            metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], qsz)
+            metrics['queue_sum'] += qsz
+            metrics['queue_samples'] += 1
             next_frame_time += frame_duration  # Schedule next frame exactly 20ms later
         # Emit tts_stopped with appropriate reason and include VAD/RMS profiling
         if session_id and not state.get('tts_stop_emitted', False):
@@ -648,6 +684,31 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             if rms_vals:
                 payload['rms_p50'] = _pct(rms_vals, 50)
                 payload['rms_p90'] = _pct(rms_vals, 90)
+            # Playback drift metrics
+            if sent_frames > 0 and send_start_mono is not None:
+                actual_ms = int((time.monotonic() - send_start_mono) * 1000)
+                expected_ms = sent_frames * 20
+                drift_ms = actual_ms - expected_ms
+                payload['drift_ms'] = drift_ms
+                payload['expected_ms'] = expected_ms
+                payload['actual_ms'] = actual_ms
+                warn = abs(drift_ms) > 50
+                log_event("tts_playback_drift", session_id=session_id or "", utterance_id=utterance_id, metrics={"expected_ms": expected_ms, "actual_ms": actual_ms, "drift_ms": drift_ms, "warn": warn})
+            # Queue depth averages
+            if metrics.get('queue_samples', 0) > 0:
+                payload['avg_queue_frames'] = float(metrics['queue_sum']) / float(metrics['queue_samples'])
+            payload['queue_peak_frames'] = metrics.get('queue_peak_frames', 0)
+            payload['underruns'] = metrics.get('underruns', 0)
+            # Producer metrics
+            if metrics.get('producer_total_chunks') is not None:
+                payload['producer_total_chunks'] = metrics.get('producer_total_chunks', 0)
+            if metrics.get('producer_total_bytes') is not None:
+                payload['producer_total_bytes'] = metrics.get('producer_total_bytes', 0)
+            ps = metrics.get('producer_stream_start_ts_ms')
+            pe = metrics.get('producer_stream_end_ts_ms')
+            if ps and pe and pe >= ps:
+                payload['producer_stream_duration_ms'] = int(pe - ps)
+
             evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
             state['tts_stop_emitted'] = True
             await ws_queue.put(evt)
