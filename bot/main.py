@@ -20,22 +20,141 @@ def _mono_ms():
     return int(time.monotonic() * 1000)
 
 
-def log_event(event: str, session_id: str = None, utterance_id: str = None, src: str = "worker_local", reason: str = None, metrics: dict | None = None):
-    rec = {
-        "ts_ms": _now_ts_ms(),
-        "mono_ms": _mono_ms(),
-        "event": event,
-        "src": src,
-    }
-    if session_id:
-        rec["session_id"] = session_id
-    if utterance_id:
-        rec["utterance_id"] = utterance_id
+# Log configuration
+LOG_FORMAT = os.environ.get("LOG_FORMAT", "pretty")  # "pretty" or "json"
+LOG_VERBOSE = os.environ.get("LOG_VERBOSE", "false").lower() not in ("0", "false", "no")
+LOG_MIN_EVENTS = set((os.environ.get("LOG_MIN_EVENTS", "") or "").split(",")) if os.environ.get("LOG_MIN_EVENTS") else {
+    # Core lifecycle
+    "bot_joining", "daily_joined", "daily_mic_enabled", "bot_joined", "bot_exit",
+    # Call/participant
+    "bot_waiting_for_participant", "participant_joined", "subscribed_media", "bot_participant_ready",
+    # TTS key points
+    "tts_mode", "tts_started", "tts_first_audio", "tts_playback_done", "tts_timing_breakdown",
+    # Barge-in
+    "local_stop_triggered", "vad_start_suppressed", "barge_in_detected",
+    # Errors
+    "stderr", "bot_error", "candidate_audio_hook_failed", "speaker_read_error", "daily_join_error",
+}
+
+
+def _log_icon(event: str) -> str:
+    """Return icon for event type."""
+    if "error" in event or event == "stderr":
+        return "✗"
+    if "suppressed" in event:
+        return "⊘"
+    if event in ("local_stop_triggered", "barge_in_detected"):
+        return "⚡"
+    if event in ("tts_first_audio", "tts_timing_breakdown"):
+        return "♪"
+    if "participant" in event or "subscribed" in event:
+        return "👤"
+    return "▶"
+
+
+def _log_summary(event: str, reason: str | None, metrics: dict | None) -> str:
+    """Return concise summary of key metrics for pretty format."""
+    parts = []
     if reason:
-        rec["reason"] = reason
-    if metrics:
-        rec["metrics"] = metrics
-    print(json.dumps(rec), flush=True)
+        parts.append(f"reason={reason}")
+    if not metrics:
+        return " ".join(parts)
+
+    # Event-specific summaries (most important fields only)
+    m = metrics
+    if event == "tts_timing_breakdown":
+        if m.get("first_frame_sent_ts_ms") and m.get("tts_started_ts_ms"):
+            latency = m["first_frame_sent_ts_ms"] - m["tts_started_ts_ms"]
+            parts.append(f"first_audio={latency}ms")
+    elif event == "tts_first_audio":
+        if m.get("first_audio_ms"):
+            parts.append(f"latency={m['first_audio_ms']}ms")
+    elif event == "tts_started":
+        if m.get("text_chars"):
+            parts.append(f"chars={m['text_chars']}")
+        if m.get("streaming") is not None:
+            parts.append(f"streaming={m['streaming']}")
+    elif event == "tts_playback_done":
+        if m.get("sent_frames"):
+            parts.append(f"frames={m['sent_frames']}")
+        if m.get("completed_normally") is not None:
+            parts.append("completed" if m["completed_normally"] else "interrupted")
+    elif event in ("local_stop_triggered", "vad_start_suppressed"):
+        if m.get("rms") is not None:
+            parts.append(f"rms={int(m['rms'])}")
+        if m.get("guard_ok") is not None:
+            parts.append(f"guard={'ok' if m['guard_ok'] else 'wait'}")
+        if m.get("speaking_armed") is not None:
+            parts.append(f"armed={m['speaking_armed']}")
+    elif event == "barge_in_detected":
+        if m.get("latency_ms") is not None:
+            parts.append(f"latency={m['latency_ms']}ms")
+    elif event == "participant_joined" or event == "subscribed_media":
+        if m.get("participant_id"):
+            parts.append(f"id={m['participant_id'][:8]}")
+    elif event == "bot_waiting_for_participant":
+        if m.get("timeout_s"):
+            parts.append(f"timeout={m['timeout_s']}s")
+    elif event == "tts_mode":
+        if m.get("streaming") is not None:
+            parts.append(f"streaming={m['streaming']}")
+    elif event == "daily_mic_enabled":
+        if m.get("audio_processing"):
+            parts.append(f"processing={m['audio_processing']}")
+    elif event == "stderr" or event == "bot_error":
+        if m.get("message"):
+            msg = m["message"][:60] + "..." if len(m.get("message", "")) > 60 else m.get("message", "")
+            parts.append(msg)
+        if m.get("error"):
+            parts.append(f"error={m['error'][:40]}")
+    else:
+        # Generic: show first 2-3 simple values
+        shown = 0
+        for k, v in m.items():
+            if shown >= 3:
+                break
+            if isinstance(v, (str, int, float, bool)) and v is not None:
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.1f}")
+                elif isinstance(v, str) and len(v) > 20:
+                    parts.append(f"{k}={v[:20]}...")
+                else:
+                    parts.append(f"{k}={v}")
+                shown += 1
+
+    return " ".join(parts)
+
+
+def log_event(event: str, session_id: str = None, utterance_id: str = None, src: str = "worker_local", reason: str = None, metrics: dict | None = None):
+    if not LOG_VERBOSE and event not in LOG_MIN_EVENTS:
+        return
+
+    if LOG_FORMAT == "json":
+        # Machine-readable JSON format
+        rec = {
+            "ts_ms": _now_ts_ms(),
+            "mono_ms": _mono_ms(),
+            "event": event,
+            "src": src,
+        }
+        if session_id:
+            rec["session_id"] = session_id
+        if utterance_id:
+            rec["utterance_id"] = utterance_id
+        if reason:
+            rec["reason"] = reason
+        if metrics:
+            rec["metrics"] = metrics
+        print(json.dumps(rec), flush=True)
+    else:
+        # Human-readable pretty format
+        ts = time.strftime("%H:%M:%S", time.localtime())
+        ms = int(time.time() * 1000) % 1000
+        icon = _log_icon(event)
+        summary = _log_summary(event, reason, metrics)
+        # Truncate session_id for display
+        sid_short = f" [{session_id[:8]}]" if session_id else ""
+        print(f"{ts}.{ms:03d} {icon} {event:<28}{sid_short} {summary}", flush=True)
 
 
 def log(msg: str, **kwargs):
@@ -1086,16 +1205,16 @@ async def main():
     # Shared worker state for local-stop logic (init early so WS policy can update it)
     state = {'speaking': False, 'active_utterance_id': '', 'last_vad_ts_ms': 0, 'tts_stop_emitted': False}
     state['local_stop_enabled'] = os.environ.get('LOCAL_STOP_ENABLED', 'true').lower() not in ('0', 'false', 'no')
-    # Guard to avoid barge-in before users hear anything; default 250ms
+    # Guard to avoid barge-in before users hear anything; default 500ms (tunable)
     try:
-        state['local_stop_guard_ms'] = int(os.environ.get('LOCAL_STOP_GUARD_MS', '250'))
+        state['local_stop_guard_ms'] = int(os.environ.get('LOCAL_STOP_GUARD_MS', '500'))
     except Exception:
-        state['local_stop_guard_ms'] = 250
-    # Minimum RMS (0-32767) to accept VAD start as real speech; default 800
+        state['local_stop_guard_ms'] = 500
+    # Minimum RMS (0-32767) to accept VAD start as real speech; default 1200 (tunable)
     try:
-        state['local_stop_min_rms'] = int(os.environ.get('LOCAL_STOP_MIN_RMS', '800'))
+        state['local_stop_min_rms'] = int(os.environ.get('LOCAL_STOP_MIN_RMS', '1200'))
     except Exception:
-        state['local_stop_min_rms'] = 800
+        state['local_stop_min_rms'] = 1200
 
     ws_task = None
     if ws_url:
@@ -1139,9 +1258,9 @@ async def main():
     state['speaking_armed'] = False  # only arm after first audio is sent
     # Require multiple consecutive speech frames while TTS is active to reduce false positives
     try:
-        vad_start_frames_during_tts = int(os.environ.get('WORKER_VAD_MIN_START_FRAMES_WHILE_TTS', '3'))
+        vad_start_frames_during_tts = int(os.environ.get('WORKER_VAD_MIN_START_FRAMES_WHILE_TTS', '4'))
     except Exception:
-        vad_start_frames_during_tts = 3
+        vad_start_frames_during_tts = 4
     vad.min_start_frames = max(1, vad_start_frames_during_tts)
     # Reset per-utterance counters and RMS profiling
     state['vad_counters'] = {'vad_starts_total': 0, 'vad_stops_allowed': 0, 'vad_suppressed_guard': 0, 'vad_suppressed_energy': 0, 'vad_suppressed_minframes': 0}
