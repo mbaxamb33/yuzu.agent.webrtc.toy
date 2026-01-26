@@ -173,11 +173,192 @@ class VADState:
                 return None, None, info
 
 
+class VADManager:
+    """Encapsulates VAD gating, counters, guard, energy checks, and WS signaling."""
+    def __init__(self, loop, ws_queue, session_id, stop_event, state, vad: VADState):
+        self.loop = loop
+        self.ws_queue = ws_queue
+        self.session_id = session_id or ""
+        self.stop_event = stop_event
+        self.state = state
+        self.vad = vad
+        # Ensure per-utterance counters exist in state (reset at utterance start elsewhere)
+        self.state.setdefault('vad_counters', {'vad_starts_total': 0, 'vad_stops_allowed': 0, 'vad_suppressed_guard': 0, 'vad_suppressed_energy': 0, 'vad_suppressed_minframes': 0})
+
+    def on_frame(self, frame: bytes):
+        ev, ts, vinf = self.vad.process_frame(frame, 48000)
+        counters = self.state.setdefault('vad_counters', {
+            'vad_starts_total': 0,
+            'vad_stops_allowed': 0,
+            'vad_suppressed_guard': 0,
+            'vad_suppressed_energy': 0,
+            'vad_suppressed_minframes': 0,
+        })
+        now_ms = int(time.time() * 1000)
+        # RMS profiling once per ~1s while TTS speaking
+        try:
+            arr = np.frombuffer(frame, dtype=np.int16)
+            rms_prof = float(np.sqrt(np.mean((arr.astype(np.float64))**2))) if arr.size > 0 else 0.0
+        except Exception:
+            rms_prof = 0.0
+        if self.state.get('speaking', False):
+            last_sample = self.state.get('rms_last_sample_ts', 0)
+            if now_ms - int(last_sample) >= 1000:
+                self.state.setdefault('rms_samples', []).append(rms_prof)
+                self.state['rms_last_sample_ts'] = now_ms
+
+        if vinf.get('prestart'):
+            counters['vad_suppressed_minframes'] += 1
+
+        if ev == 'start':
+            counters['vad_starts_total'] += 1
+            # Compute gate inputs
+            try:
+                arr = np.frombuffer(frame, dtype=np.int16)
+                rms = float(np.sqrt(np.mean((arr.astype(np.float64))**2))) if arr.size > 0 else 0.0
+            except Exception:
+                rms = 0.0
+            guard_ok = False
+            try:
+                armed_ts = int(self.state.get('speaking_armed_ts_ms', 0) or 0)
+                guard_ms = int(self.state.get('local_stop_guard_ms', 0) or 0)
+                guard_ok = (armed_ts > 0) and (now_ms - armed_ts >= guard_ms)
+                if guard_ok and not self.state.get('guard_elapsed_logged', False):
+                    log_event("local_stop_guard_elapsed", metrics={"guard_ms": guard_ms, "elapsed_ms": now_ms - armed_ts})
+                    self.state['guard_elapsed_logged'] = True
+            except Exception:
+                guard_ok = True
+            min_rms = float(self.state.get('local_stop_min_rms', 0) or 0)
+            payload_extra = {"rms": rms, "rms_threshold": min_rms, "guard_ok": guard_ok, "speaking_armed": self.state.get('speaking_armed', False), "speaking_armed_ts_ms": self.state.get('speaking_armed_ts_ms', 0)}
+            # WS: vad_start
+            evt = {"type": "vad_start", "ts_ms": ts, "session_id": self.session_id, "utterance_id": self.state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio", **payload_extra}}
+            self.loop.call_soon_threadsafe(self.ws_queue.put_nowait, evt)
+            # Gated stop
+            self.state['last_vad_ts_ms'] = ts
+            if self.state.get('local_stop_enabled', True) and self.state.get('speaking_armed', False) and guard_ok and rms >= min_rms:
+                counters['vad_stops_allowed'] += 1
+                log_event("local_stop_triggered", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), metrics=payload_extra)
+                try:
+                    self.loop.call_soon_threadsafe(self.stop_event.set)
+                except Exception as e1:
+                    log_event("local_stop_schedule_error", reason="call_soon_threadsafe", metrics={"error": str(e1)})
+                    try:
+                        self.stop_event.set()
+                    except Exception as e2:
+                        log_event("local_stop_schedule_error", reason="fallback_set", metrics={"error": str(e2)})
+            else:
+                if not guard_ok:
+                    counters['vad_suppressed_guard'] += 1
+                    log_event("vad_start_suppressed", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), reason="guard", metrics=payload_extra)
+                elif rms < min_rms:
+                    counters['vad_suppressed_energy'] += 1
+                    log_event("vad_start_suppressed", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), reason="energy", metrics=payload_extra)
+        elif ev == 'end':
+            evt = {"type": "vad_end", "ts_ms": ts, "session_id": self.session_id, "utterance_id": self.state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
+            self.loop.call_soon_threadsafe(self.ws_queue.put_nowait, evt)
+
+
+class TTSMetrics:
+    def __init__(self, tts_started_ts_ms: int | None = None):
+        self.tts_started_ts_ms = tts_started_ts_ms
+        self.tts_request_sent_ts_ms = None
+        self.elevenlabs_headers_ts_ms = None
+        self.elevenlabs_first_chunk_ts_ms = None
+        self.prebuffer_done_ts_ms = None
+        self.first_frame_sent_ts_ms = None
+        self.producer_first_frame_queued_ts_ms = None
+        self.producer_total_chunks = 0
+        self.producer_total_bytes = 0
+        self.producer_stream_start_ts_ms = None
+        self.producer_stream_end_ts_ms = None
+        self.queue_peak_frames = 0
+        self.queue_sum = 0
+        self.queue_samples = 0
+        self.underruns = 0
+        self.send_start_mono = None
+
+    def mark_request_sent(self):
+        self.tts_request_sent_ts_ms = int(time.time() * 1000)
+
+    def mark_headers(self):
+        self.elevenlabs_headers_ts_ms = int(time.time() * 1000)
+
+    def mark_first_chunk(self, length: int):
+        ts = int(time.time() * 1000)
+        self.elevenlabs_first_chunk_ts_ms = ts
+        if self.producer_stream_start_ts_ms is None:
+            self.producer_stream_start_ts_ms = ts
+
+    def mark_producer_first_frame_queued(self):
+        if self.producer_first_frame_queued_ts_ms is None:
+            self.producer_first_frame_queued_ts_ms = int(time.time() * 1000)
+
+    def add_chunk(self, length: int):
+        self.producer_total_chunks += 1
+        self.producer_total_bytes += int(length)
+
+    def mark_stream_end(self):
+        self.producer_stream_end_ts_ms = int(time.time() * 1000)
+
+    def mark_prebuffer_done(self):
+        self.prebuffer_done_ts_ms = int(time.time() * 1000)
+
+    def mark_first_frame_sent(self):
+        self.first_frame_sent_ts_ms = int(time.time() * 1000)
+
+    def begin_send_timing(self):
+        self.send_start_mono = time.monotonic()
+
+    def add_queue_sample(self, qsize: int):
+        self.queue_peak_frames = max(self.queue_peak_frames, int(qsize))
+        self.queue_sum += int(qsize)
+        self.queue_samples += 1
+
+    def inc_underrun(self):
+        self.underruns += 1
+
+    def emit_breakdown(self, session_id: str | None, utterance_id: str | None):
+        breakdown = {
+            "tts_started_ts_ms": self.tts_started_ts_ms,
+            "tts_request_sent_ts_ms": self.tts_request_sent_ts_ms,
+            "elevenlabs_headers_ts_ms": self.elevenlabs_headers_ts_ms,
+            "elevenlabs_first_chunk_ts_ms": self.elevenlabs_first_chunk_ts_ms,
+            "prebuffer_done_ts_ms": self.prebuffer_done_ts_ms,
+            "first_frame_sent_ts_ms": self.first_frame_sent_ts_ms,
+        }
+        log_event("tts_timing_breakdown", session_id=session_id or "", utterance_id=utterance_id, metrics=breakdown)
+
+    def add_to_payload_and_log(self, payload: dict, session_id: str | None, utterance_id: str | None, sent_frames: int):
+        # Drift
+        if sent_frames > 0 and self.send_start_mono is not None:
+            actual_ms = int((time.monotonic() - self.send_start_mono) * 1000)
+            expected_ms = int(sent_frames * 20)
+            drift_ms = actual_ms - expected_ms
+            payload['drift_ms'] = drift_ms
+            payload['expected_ms'] = expected_ms
+            payload['actual_ms'] = actual_ms
+            warn = abs(drift_ms) > 50
+            log_event("tts_playback_drift", session_id=session_id or "", utterance_id=utterance_id, metrics={"expected_ms": expected_ms, "actual_ms": actual_ms, "drift_ms": drift_ms, "warn": warn})
+        # Queue
+        if self.queue_samples > 0:
+            payload['avg_queue_frames'] = float(self.queue_sum) / float(self.queue_samples)
+        payload['queue_peak_frames'] = self.queue_peak_frames
+        payload['underruns'] = self.underruns
+        # Producer
+        payload['producer_total_chunks'] = self.producer_total_chunks
+        payload['producer_total_bytes'] = self.producer_total_bytes
+        ps = self.producer_stream_start_ts_ms
+        pe = self.producer_stream_end_ts_ms
+        if ps and pe and pe >= ps:
+            payload['producer_stream_duration_ms'] = int(pe - ps)
+
+
 def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event, state):
     """Register a candidate-audio VAD callback; bridge to asyncio with call_soon_threadsafe."""
     frame_bytes = int(48000 * 0.02) * 2  # 20ms @48k, 16-bit mono
     buf = bytearray()
     frame_count = [0]  # Use list for nonlocal mutation in nested function
+    manager = VADManager(loop, ws_queue, session_id, stop_event, state, vad)
 
     def handle_frame(pcm_bytes, sample_rate=48000, channels=1):
         nonlocal buf
@@ -198,79 +379,7 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
         while len(buf) >= frame_bytes:
             frame = bytes(buf[:frame_bytes])
             del buf[:frame_bytes]
-            ev, ts, vinf = vad.process_frame(frame, 48000)
-            # VAD suppression counters per utterance
-            counters = state.setdefault('vad_counters', {
-                'vad_starts_total': 0,
-                'vad_stops_allowed': 0,
-                'vad_suppressed_guard': 0,
-                'vad_suppressed_energy': 0,
-                'vad_suppressed_minframes': 0,
-            })
-            # Sample RMS for environment profiling (once per ~1s while speaking)
-            now_ms = int(time.time() * 1000)
-            try:
-                frm_arr_prof = np.frombuffer(frame, dtype=np.int16)
-                rms_prof = float(np.sqrt(np.mean((frm_arr_prof.astype(np.float64))**2))) if frm_arr_prof.size > 0 else 0.0
-            except Exception:
-                rms_prof = 0.0
-            if state.get('speaking', False):
-                last_sample = state.get('rms_last_sample_ts', 0)
-                if now_ms - int(last_sample) >= 1000:
-                    state.setdefault('rms_samples', []).append(rms_prof)
-                    state['rms_last_sample_ts'] = now_ms
-
-            if vinf.get('prestart'):
-                counters['vad_suppressed_minframes'] += 1
-
-            if ev == 'start':
-                counters['vad_starts_total'] += 1
-                # Compute RMS & gating
-                try:
-                    frm_arr = np.frombuffer(frame, dtype=np.int16)
-                    rms = float(np.sqrt(np.mean((frm_arr.astype(np.float64))**2))) if frm_arr.size > 0 else 0.0
-                except Exception:
-                    rms = 0.0
-                guard_ok = False
-                try:
-                    armed_ts = int(state.get('speaking_armed_ts_ms', 0) or 0)
-                    guard_ms = int(state.get('local_stop_guard_ms', 0) or 0)
-                    guard_ok = (armed_ts > 0) and (now_ms - armed_ts >= guard_ms)
-                    if guard_ok and not state.get('guard_elapsed_logged', False):
-                        log_event("local_stop_guard_elapsed", metrics={"guard_ms": guard_ms, "elapsed_ms": now_ms - armed_ts})
-                        state['guard_elapsed_logged'] = True
-                except Exception:
-                    guard_ok = True
-                min_rms = float(state.get('local_stop_min_rms', 0) or 0)
-                payload_extra = {"rms": rms, "rms_threshold": min_rms, "guard_ok": guard_ok, "speaking_armed": state.get('speaking_armed', False), "speaking_armed_ts_ms": state.get('speaking_armed_ts_ms', 0)}
-                evt = {"type": "vad_start", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio", **payload_extra}}
-                loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
-                # Local-stop decision
-                state['last_vad_ts_ms'] = ts
-                if state.get('local_stop_enabled', True) and state.get('speaking_armed', False) and guard_ok and rms >= min_rms:
-                    counters['vad_stops_allowed'] += 1
-                    log_event("local_stop_triggered", session_id=session_id or "", utterance_id=state.get('active_utterance_id', ''), metrics=payload_extra)
-                    # Schedule stop on the asyncio loop thread; thread-safe
-                    try:
-                        loop.call_soon_threadsafe(stop_event.set)
-                    except Exception as e1:
-                        log_event("local_stop_schedule_error", reason="call_soon_threadsafe", metrics={"error": str(e1)})
-                        # Fallback (non-thread-safe) in case loop reference is invalid
-                        try:
-                            stop_event.set()
-                        except Exception as e2:
-                            log_event("local_stop_schedule_error", reason="fallback_set", metrics={"error": str(e2)})
-                else:
-                    # Suppression attribution
-                    if not guard_ok:
-                        counters['vad_suppressed_guard'] += 1
-                        log_event("vad_start_suppressed", session_id=session_id or "", utterance_id=state.get('active_utterance_id', ''), reason="guard", metrics=payload_extra)
-                    elif rms < min_rms:
-                        counters['vad_suppressed_energy'] += 1
-                        log_event("vad_start_suppressed", session_id=session_id or "", utterance_id=state.get('active_utterance_id', ''), reason="energy", metrics=payload_extra)
-            elif ev == 'end':
-                evt = {"type": "vad_end", "ts_ms": ts, "session_id": session_id or "", "utterance_id": state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
-                loop.call_soon_threadsafe(ws_queue.put_nowait, evt)
+            manager.on_frame(frame)
 
     # Try to register callback on transport
     if hasattr(transport, 'on_remote_audio'):
@@ -442,7 +551,7 @@ def slice_frames(pcm16_bytes: bytearray, frame_bytes: int):
         yield chunk
 
 
-def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, stop_flag: threading.Event, metrics: dict):
+def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, stop_flag: threading.Event, metrics):
     """Blocking producer: streams raw PCM from ElevenLabs and pushes 20ms PCM16@48k frames via the loop to an asyncio.Queue with backpressure."""
     import requests
     # Use native 48kHz PCM format - no resampling needed
@@ -457,23 +566,19 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
     out_buf = bytearray()
     raw_buf = bytearray()  # Buffer for unaligned incoming bytes
     # Mark request start for timing breakdown
-    ts_now = int(time.time() * 1000)
-    metrics['tts_request_sent_ts_ms'] = ts_now
+    metrics.mark_request_sent()
     log_event("tts_producer_http_request_start")
     chunk_count = 0
     try:
         with requests.post(url, headers=headers, data=json.dumps(data), stream=True, timeout=30) as resp:
             log_event("tts_producer_http_response", metrics={"status": resp.status_code})
-            metrics['elevenlabs_headers_ts_ms'] = int(time.time() * 1000)
+            metrics.mark_headers()
             resp.raise_for_status()
-            metrics['producer_total_chunks'] = 0
-            metrics['producer_total_bytes'] = 0
             for chunk in resp.iter_content(chunk_size=4096):
                 chunk_count += 1
                 if chunk_count == 1:
                     log_event("tts_producer_first_chunk", metrics={"len": len(chunk)})
-                    metrics['elevenlabs_first_chunk_ts_ms'] = int(time.time() * 1000)
-                    metrics['producer_stream_start_ts_ms'] = metrics['elevenlabs_first_chunk_ts_ms']
+                    metrics.mark_first_chunk(len(chunk))
                 if stop_flag.is_set():
                     log_event("tts_producer_stop_flag", metrics={"chunk_count": chunk_count})
                     break
@@ -482,8 +587,7 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
                 # Buffer raw bytes to ensure 2-byte alignment for int16
                 raw_buf.extend(chunk)
                 # Update producer metrics
-                metrics['producer_total_chunks'] += 1
-                metrics['producer_total_bytes'] += len(chunk)
+                metrics.add_chunk(len(chunk))
                 aligned_len = (len(raw_buf) // 2) * 2
                 if aligned_len == 0:
                     continue
@@ -493,8 +597,8 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
                 out_buf.extend(aligned_bytes)
                 # Emit complete 20ms frames with backpressure
                 for frm in slice_frames(out_buf, frame_bytes_48k):
-                    if metrics.get('first_frame_sent_ts_ms') is None:
-                        metrics['first_frame_sent_ts_ms'] = int(time.time() * 1000)
+                    if metrics.producer_first_frame_queued_ts_ms is None:
+                        metrics.mark_producer_first_frame_queued()
                         log_event("tts_producer_first_frame_queued")
                     fut = asyncio.run_coroutine_threadsafe(queue.put(frm), loop)
                     try:
@@ -503,7 +607,7 @@ def _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, sto
                         log_event("tts_queue_put_failed", metrics={"error": str(e)})
                         return
             log_event("tts_producer_http_stream_finished")
-            metrics['producer_stream_end_ts_ms'] = int(time.time() * 1000)
+            metrics.mark_stream_end()
             # Send sentinel to signal completion
             fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
             try:
@@ -525,18 +629,12 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
     log_event("tts_streaming_play_started", session_id=session_id or "", utterance_id=utterance_id)
     queue = asyncio.Queue(maxsize=25)  # ~500ms at 20ms frames
     frame_bytes = int(48000 * 0.02) * 2
-    metrics = {
-        'first_frame_sent_ts_ms': None,
-        'queue_peak_frames': 0,
-        'queue_sum': 0,
-        'queue_samples': 0,
-        'underruns': 0,
-    }
+    tm = TTSMetrics(state.get('tts_started_ts_ms'))
     stop_flag = threading.Event()
 
     def start_producer():
         log_event("tts_producer_start", session_id=session_id or "", utterance_id=utterance_id)
-        _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, stop_flag, metrics)
+        _producer_stream_elevenlabs(eleven_api_key, voice_id, text, loop, queue, stop_flag, tm)
         log_event("tts_producer_finished", session_id=session_id or "", utterance_id=utterance_id)
 
     # Start producer in threadpool
@@ -559,9 +657,9 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
         else:
             log_event("tts_producer_finished_during_prebuffer", session_id=session_id or "", utterance_id=utterance_id)
             break
-        metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], queue.qsize())
+    tm.add_queue_sample(queue.qsize())
     log_event("tts_prebuffer_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"queue_size": queue.qsize()})
-    metrics['prebuffer_done_ts_ms'] = int(time.time() * 1000)
+    tm.mark_prebuffer_done()
 
     # Consumer loop with monotonic timing for consistent frame rate
     sent_frames = 0
@@ -578,7 +676,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             except asyncio.TimeoutError:
                 # True underrun - no data for 500ms during streaming
                 log_event("tts_consumer_underrun", session_id=session_id or "", utterance_id=utterance_id)
-                metrics['underruns'] = metrics.get('underruns', 0) + 1
+                tm.inc_underrun()
                 reason = 'buffer_underrun'
                 if session_id and not state.get('tts_stop_emitted', False):
                     now_ts = int(time.time() * 1000)
@@ -621,18 +719,9 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                     state['speaking_armed'] = True
                     state['speaking_armed_ts_ms'] = int(time.time() * 1000)
                     log_event("speaking_armed", session_id=session_id or "", utterance_id=utterance_id, metrics={"speaking_armed_ts_ms": state['speaking_armed_ts_ms']})
-                    metrics['first_frame_sent_ts_ms'] = int(time.time() * 1000)
-                    # Emit timing breakdown once on first frame sent
-                    breakdown = {
-                        "tts_started_ts_ms": state.get('tts_started_ts_ms'),
-                        "tts_request_sent_ts_ms": metrics.get('tts_request_sent_ts_ms'),
-                        "elevenlabs_headers_ts_ms": metrics.get('elevenlabs_headers_ts_ms'),
-                        "elevenlabs_first_chunk_ts_ms": metrics.get('elevenlabs_first_chunk_ts_ms'),
-                        "prebuffer_done_ts_ms": metrics.get('prebuffer_done_ts_ms'),
-                        "first_frame_sent_ts_ms": metrics.get('first_frame_sent_ts_ms'),
-                    }
-                    log_event("tts_timing_breakdown", session_id=session_id or "", utterance_id=utterance_id, metrics=breakdown)
-                    send_start_mono = time.monotonic()
+                    tm.mark_first_frame_sent()
+                    tm.emit_breakdown(session_id, utterance_id)
+                    tm.begin_send_timing()
                 if not first_audio_emitted:
                     first_audio_emitted = True
                     if session_id:
@@ -648,9 +737,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 break
 
             qsz = queue.qsize()
-            metrics['queue_peak_frames'] = max(metrics['queue_peak_frames'], qsz)
-            metrics['queue_sum'] += qsz
-            metrics['queue_samples'] += 1
+            tm.add_queue_sample(qsz)
             next_frame_time += frame_duration  # Schedule next frame exactly 20ms later
         # Emit tts_stopped with appropriate reason and include VAD/RMS profiling
         if session_id and not state.get('tts_stop_emitted', False):
@@ -684,30 +771,8 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             if rms_vals:
                 payload['rms_p50'] = _pct(rms_vals, 50)
                 payload['rms_p90'] = _pct(rms_vals, 90)
-            # Playback drift metrics
-            if sent_frames > 0 and send_start_mono is not None:
-                actual_ms = int((time.monotonic() - send_start_mono) * 1000)
-                expected_ms = sent_frames * 20
-                drift_ms = actual_ms - expected_ms
-                payload['drift_ms'] = drift_ms
-                payload['expected_ms'] = expected_ms
-                payload['actual_ms'] = actual_ms
-                warn = abs(drift_ms) > 50
-                log_event("tts_playback_drift", session_id=session_id or "", utterance_id=utterance_id, metrics={"expected_ms": expected_ms, "actual_ms": actual_ms, "drift_ms": drift_ms, "warn": warn})
-            # Queue depth averages
-            if metrics.get('queue_samples', 0) > 0:
-                payload['avg_queue_frames'] = float(metrics['queue_sum']) / float(metrics['queue_samples'])
-            payload['queue_peak_frames'] = metrics.get('queue_peak_frames', 0)
-            payload['underruns'] = metrics.get('underruns', 0)
-            # Producer metrics
-            if metrics.get('producer_total_chunks') is not None:
-                payload['producer_total_chunks'] = metrics.get('producer_total_chunks', 0)
-            if metrics.get('producer_total_bytes') is not None:
-                payload['producer_total_bytes'] = metrics.get('producer_total_bytes', 0)
-            ps = metrics.get('producer_stream_start_ts_ms')
-            pe = metrics.get('producer_stream_end_ts_ms')
-            if ps and pe and pe >= ps:
-                payload['producer_stream_duration_ms'] = int(pe - ps)
+            # Add drift, queue, and producer metrics
+            tm.add_to_payload_and_log(payload, session_id, utterance_id, sent_frames)
 
             evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
             state['tts_stop_emitted'] = True
@@ -725,9 +790,9 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
         except Exception:
             pass
         # Emit queue peak metric
-        if session_id and metrics['queue_peak_frames'] is not None:
+        if session_id:
             now_ts = int(time.time() * 1000)
-            evt = {"type": "tts_queue_peak_frames", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": {"peak_frames": metrics['queue_peak_frames']}}
+            evt = {"type": "tts_queue_peak_frames", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": {"peak_frames": tm.queue_peak_frames}}
             with contextlib.suppress(Exception):
                 await ws_queue.put(evt)
         # Disarm local-stop after playback concludes
