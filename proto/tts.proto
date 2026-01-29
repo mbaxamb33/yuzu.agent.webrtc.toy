@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package tts.v1;
+
+option go_package = "yuzu/agent/internal/tts/pb;ttspb";
+
+message StartRequest {
+  string session_id = 1;
+  string request_id = 2;
+  string voice_id = 3;   // ElevenLabs voice id
+  string text = 4;
+}
+
+message Cancel { string request_id = 1; }
+
+message ClientMessage {
+  oneof msg {
+    StartRequest start = 1;
+    Cancel cancel = 2;
+  }
+}
+
+message Connected { string session_id = 1; }
+message AudioChunk { bytes pcm48k = 1; }
+message Error { string code = 1; string message = 2; }
+
+message ServerMessage {
+  oneof msg {
+    Connected connected = 1;
+    AudioChunk audio = 2;
+    Error error = 3;
+  }
+}
+
+service TTS {
+  rpc Session(stream ClientMessage) returns (stream ServerMessage);
+}
+

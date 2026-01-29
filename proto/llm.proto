@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package llm.v1;
+
+option go_package = "yuzu/agent/internal/llm/pb;llmpb";
+
+// Basic chat message
+message ChatMessage {
+  string role = 1;   // system | user | assistant
+  string content = 2;
+}
+
+// Client→Server
+message StartRequest {
+  string session_id = 1;
+  string request_id = 2;
+  string deployment = 3; // Azure OpenAI deployment name
+  string api_version = 4; // Azure API version, e.g., 2024-02-15-preview
+  repeated ChatMessage messages = 5;
+  bool stream = 6; // should be true for streaming
+  uint32 max_tokens = 7; // optional
+  double temperature = 8; // optional
+}
+
+message Cancel { string request_id = 1; }
+
+message ClientMessage {
+  oneof msg {
+    StartRequest start = 1;
+    Cancel cancel = 2;
+  }
+}
+
+// Server→Client
+message Connected { string session_id = 1; }
+
+message Token { string text = 1; }
+
+message Sentence { string text = 1; }
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+}
+
+message Error { string code = 1; string message = 2; }
+
+message ServerMessage {
+  oneof msg {
+    Connected connected = 1;
+    Token token = 2;
+    Sentence sentence = 3;
+    Usage usage = 4;
+    Error error = 5;
+  }
+}
+
+service LLM {
+  rpc Session(stream ClientMessage) returns (stream ServerMessage);
+}
+

@@ -7,3 +7,7 @@ bin/
 # Environment (contains secrets)
 .env
 
+.venv/
+
+# Test audio files
+testdata/

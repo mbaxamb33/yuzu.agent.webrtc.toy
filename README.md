@@ -38,3 +38,46 @@ Example:
 ```bash
 SERVER_ADDR=":8081" DAILY_DOMAIN_URL="https://your-team.daily.co" make server
 ```
+
+## Proto code generation
+
+Shared proto lives at `proto/stt.proto`.
+
+- Go stubs:
+  - Requirements: `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`
+  - Generate all: `make proto-go` (stt, gateway_control, llm, tts)
+
+- Python stubs:
+  - Requirements: `grpcio-tools` (dev‑only)
+  - Install: `pip install -r dev-requirements.txt`
+  - Generate all: `make proto-py` (outputs to `gateway/` and patches imports)
+
+Runtime Python dependencies are under `gateway/requirements.txt`; `grpcio-tools` is used only for code generation.
+
+## Gateway (Python) and STT Sidecar
+
+- Gateway (Python) handles Daily I/O and control only. Policy (VAD, barge‑in, LLM, TTS decisions) lives in Go services.
+- STT uses the Go sidecar; builtin Python STT has been removed.
+
+- Run sidecar locally (UDS at `/run/app/stt.sock` by default):
+  - `make sidecar`
+- Build sidecar binary:
+  - `make sidecar-build` (outputs `bin/stt-sidecar`)
+
+Gateway configuration to use sidecar:
+
+```bash
+STT_ENABLED=true STT_UDS_PATH=/run/app/stt.sock python -m gateway.main
+```
+
+Note: `STT_MODE` is deprecated; sidecar is the only supported mode.
+
+## CI
+
+- Proto drift check runs in CI (`.github/workflows/proto-check.yml`):
+  - Regenerates Go and Python stubs and fails if there are diffs.
+
+## Dev convenience
+
+- Start all Go services locally:
+  - `make all-services` (runs STT sidecar, Orchestrator, LLM, and TTS; Ctrl+C to stop)

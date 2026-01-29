@@ -1,0 +1,38 @@
+name: Proto Drift Check
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  proto-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install protoc plugins
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          python -m pip install --upgrade pip
+          python -m pip install grpcio-tools
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Generate protos (Go)
+        run: make proto-go
+      - name: Generate protos (Python)
+        run: make proto-py
+      - name: Check for diffs
+        run: |
+          git status --porcelain
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Proto drift detected. Please commit generated files." && exit 1
+          fi

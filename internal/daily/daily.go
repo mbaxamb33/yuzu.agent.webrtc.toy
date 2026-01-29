@@ -101,7 +101,7 @@ func (c *HTTPClient) CreateMeetingToken(roomName, userName string, exp int64, is
 
     // Note: Daily meeting tokens do not support an 'enable_audio_processing' property.
     // Audio processing is disabled for the bot at the client level (customConstraints)
-    // in bot/main.py when enabling the virtual microphone.
+    // in gateway/main.py when enabling the virtual microphone.
 
 	payload := map[string]any{
 		"properties": properties,

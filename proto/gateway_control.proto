@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package gateway.v1;
+
+option go_package = "yuzu/agent/internal/orchestrator/pb;gatewaypb";
+
+message SessionOpen {
+  string session_id = 1;
+  string room_url = 2;
+}
+
+message VADStart { uint64 ts_ms = 1; }
+message VADEnd   { uint64 ts_ms = 1; }
+
+message TranscriptInterim {
+  string utterance_id = 1;
+  string text = 2;
+}
+
+message TranscriptFinal {
+  string utterance_id = 1;
+  string text = 2;
+}
+
+message TTSEvent {
+  string type = 1; // started | first_audio | stopped
+  string reason = 2; // if stopped
+  uint32 first_audio_ms = 3; // optional, only for first_audio
+}
+
+message GatewayError {
+  string code = 1;
+  string message = 2;
+}
+
+message FrameTap {
+  bytes pcm48k = 1; // 20ms PCM16 mono at 48kHz
+}
+
+message Feature {
+  float rms = 1; // root-mean-square energy for the 20ms frame
+}
+
+message GatewayEvent {
+  string session_id = 1;
+  oneof evt {
+    SessionOpen session_open = 2;
+    VADStart vad_start = 3;
+    VADEnd vad_end = 4;
+    TranscriptInterim transcript_interim = 5;
+    TranscriptFinal transcript_final = 6;
+    TTSEvent tts = 7;
+    GatewayError error = 8;
+    FrameTap frame_tap = 9;
+    Feature feature = 10;
+  }
+}
+
+message JoinRoom { string room_url = 1; string token = 2; }
+message StartMicToSTT { }
+message StopMicToSTT { }
+message StartTTS { string text = 1; }
+message StopTTS { string reason = 1; }
+message ArmBargeIn { uint32 guard_ms = 1; uint32 min_rms = 2; }
+message Ack { string info = 1; }
+
+message OrchestratorCommand {
+  string session_id = 1;
+  oneof cmd {
+    JoinRoom join_room = 2;
+    StartMicToSTT start_mic_to_stt = 3;
+    StopMicToSTT stop_mic_to_stt = 4;
+    StartTTS start_tts = 5;
+    StopTTS stop_tts = 6;
+    ArmBargeIn arm_barge_in = 7;
+    Ack ack = 8;
+  }
+}
+
+service GatewayControl {
+  rpc Session(stream GatewayEvent) returns (stream OrchestratorCommand);
+}

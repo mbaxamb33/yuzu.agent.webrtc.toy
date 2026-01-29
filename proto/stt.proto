@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package stt.v1;
+
+// Generate Go into internal/stt/pb with package name stt
+option go_package = "yuzu/agent/internal/stt/pb;stt";
+
+// Client -> Sidecar messages
+message ControlStart {
+  string session_id = 1;      // correlation across systems
+  string worker_id = 2;       // origin python worker id (optional)
+  string utterance_id = 3;    // current utterance id
+  string language = 4;        // e.g., en-US
+  uint32 sample_rate = 5;     // expected input (16k PCM16)
+  string protocol_version = 6; // client protocol version
+}
+
+message AudioChunk {
+  bytes pcm16k = 1;           // linear PCM16 mono @16kHz
+  uint32 duration_ms = 2;     // optional, for metrics
+}
+
+message Drain {}
+message SessionClose {}
+
+message Ping { uint64 seq = 1; }
+message Pong { uint64 seq = 1; }
+
+message ClientMessage {
+  oneof msg {
+    ControlStart start = 1;
+    AudioChunk audio = 2;
+    Drain drain = 3;
+    SessionClose close = 4;
+    Ping ping = 5;
+  }
+}
+
+// Sidecar -> Client messages
+message Connected {
+  string session_id = 1;
+  string model = 2;        // e.g., nova-2
+}
+
+message TranscriptInterim {
+  string session_id = 1;
+  string utterance_id = 2;
+  string text = 3;
+}
+
+message TranscriptFinal {
+  string session_id = 1;
+  string utterance_id = 2;
+  string text = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  CONNECTION_FAILED = 1;
+  PROVIDER_ERROR = 2;
+  TIMEOUT = 3;
+  CIRCUIT_OPEN = 4;
+  INVALID_AUDIO = 5;
+  SHUTDOWN = 6;
+}
+
+message Error {
+  string session_id = 1;
+  string code = 2; // deprecated: use enum_code
+  string message = 3;
+  ErrorCode enum_code = 4;
+}
+
+message Metrics {
+  string session_id = 1;
+  uint64 bytes_sent = 2;
+  uint64 frames_sent = 3;
+}
+
+message ServerMessage {
+  oneof msg {
+    Connected connected = 1;
+    TranscriptInterim interim = 2;
+    TranscriptFinal final = 3;
+    Error error = 4;
+    Pong pong = 5;
+    Metrics metrics = 6;
+  }
+}
+
+service STT {
+  rpc Session(stream ClientMessage) returns (stream ServerMessage);
+}
+
