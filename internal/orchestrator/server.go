@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -33,8 +34,12 @@ type sessionState struct {
 	lastGatewayStart time.Time
 
 	// LLM streaming state
-	llmCancel context.CancelFunc
-	llmActive bool
+    llmCancel context.CancelFunc
+    llmActive bool
+
+    // LLM latency tracking
+    lastTranscriptFinal time.Time
+    llmFirstSentence    bool
 }
 
 // Server implements the GatewayControl gRPC service.
@@ -101,6 +106,7 @@ func (s *Server) Session(stream gw.GatewayControl_SessionServer) error {
 			// Could log or update UI
 
 		case *gw.GatewayEvent_TranscriptFinal:
+			log.Printf("[orch] Received TranscriptFinal event sid=%s text=%q", sid, x.TranscriptFinal.GetText())
 			s.handleTranscriptFinal(ctx, st, sid, x.TranscriptFinal.GetText(), send)
 
 		case *gw.GatewayEvent_Error:
@@ -121,10 +127,14 @@ func (s *Server) handleSessionOpen(st *sessionState, sid string, roomURL string,
 		s.setState(st, "IDLE")
 	}
 
-	// Arm barge-in with defaults
-	guardMs := uint32(500)
-	minRms := uint32(1200)
-	s.armBargeIn(st, guardMs, minRms)
+	// Configure barge-in thresholds but don't arm yet - wait for TTS first_audio
+	guardMs := uint32(envInt("LOCAL_STOP_GUARD_MS", 1000))
+	minRms := uint32(envInt("LOCAL_STOP_MIN_RMS", 1200))
+	// Store minRMS in session state so it's available when first_audio arms barge-in
+	st.minRMS = float64(minRms)
+	// Set guard to distant future - will be properly armed on first_audio
+	st.guardUntil = time.Now().Add(24 * time.Hour)
+	log.Printf("[orch] session_open configured minRMS=%.0f, barge-in will arm on first_audio", st.minRMS)
 
 	// Notify gateway of barge-in config
 	s.sendCmd(stream, &gw.OrchestratorCommand{
@@ -176,4 +186,17 @@ func (s *Server) sendCmd(stream gw.GatewayControl_SessionServer, cmd *gw.Orchest
 		return false
 	}
 	return true
+}
+
+// envInt reads an environment variable as int, returning def if not set or invalid.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }

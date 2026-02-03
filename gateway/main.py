@@ -5,6 +5,10 @@ import time
 import json
 import asyncio
 import urllib.parse
+from .gateway_control_client import GatewayControlClient
+from .stt_sidecar_client import STTSidecarClient
+from .audio_utils import RingBuffer, FrameBatcher, downsample_48k_to_16k
+from .tts_client import TTSClient
 import webrtcvad
 import numpy as np
 import contextlib
@@ -30,10 +34,31 @@ LOG_MIN_EVENTS = set((os.environ.get("LOG_MIN_EVENTS", "") or "").split(",")) if
     "bot_waiting_for_participant", "participant_joined", "subscribed_media", "bot_participant_ready",
     # TTS key points
     "tts_mode", "tts_started", "tts_first_audio", "tts_playback_done", "tts_timing_breakdown",
+    "tts_producer_http_response", "tts_producer_first_chunk", "tts_producer_exception",
+    "tts_prebuffer_done", "tts_consumer_underrun", "tts_stream_complete",
+    "tts_pcm_fetched", "tts_pcm_fetch_failed",
     # Barge-in
     "local_stop_triggered", "vad_start_suppressed", "barge_in_detected",
+    # VAD events (important for debugging user speech detection)
+    "vad_start_fired", "vad_start_detected", "vad_end_reached_hangover",
+    # Orchestrator/STT
+    "orchestrator_connected", "orchestrator_connect_error", "orchestrator_arm_barge_in", "orchestrator_mic_to_stt",
+    "orchestrator_start_tts_received",
+    "stt_connected", "stt_error", "stt_utterance_start", "stt_audio_sent",
+    "stt_transcript_final", "stt_transcript_interim",
+    "stt_sending_to_orchestrator", "stt_sent_to_orchestrator", "stt_orchestrator_send_error", "stt_no_orchestrator_attached",
+    # Debug
+    "debug_env", "debug_orch_connecting", "debug_stt_config", "debug_stt_creating_client",
+    "debug_stt_attached_orch", "debug_stt_preconnecting", "debug_stt_preconnected", "debug_stt_disabled",
+    "debug_vad_start_stt_check", "debug_stt_starting_utterance", "debug_stt_start_error",
+    # Audio diagnostics
+    "speaker_reader_stats", "speaker_high_rms", "audio_processed_rms", "subscribe_failed",
+    "remote_audio_first_frame",
     # Errors
     "stderr", "bot_error", "candidate_audio_hook_failed", "speaker_read_error", "daily_join_error",
+    # Audio format detection
+    "remote_audio_first_frame", "candidate_audio_hook_set",
+    "speaker_reader_started", "speaker_reader_stats",
 }
 
 
@@ -101,6 +126,15 @@ def _log_summary(event: str, reason: str | None, metrics: dict | None) -> str:
     elif event == "daily_mic_enabled":
         if m.get("audio_processing"):
             parts.append(f"processing={m['audio_processing']}")
+    elif event == "remote_audio_first_frame":
+        if m.get("len"):
+            parts.append(f"len={m['len']}")
+        if m.get("rms_as_int16") is not None:
+            parts.append(f"rms_i16={m['rms_as_int16']}")
+        if m.get("rms_as_float32") is not None:
+            parts.append(f"rms_f32={m['rms_as_float32']}")
+        if m.get("likely_format"):
+            parts.append(f"format={m['likely_format']}")
     elif event == "stderr" or event == "bot_error":
         if m.get("message"):
             msg = m["message"][:60] + "..." if len(m.get("message", "")) > 60 else m.get("message", "")
@@ -234,18 +268,30 @@ def resample_to_48k(pcm_int16, sr):
 
 
 class VADState:
-    def __init__(self, aggressiveness=2, frame_ms=20, hangover_ms=400):
+    def __init__(self, aggressiveness=2, frame_ms=20, hangover_ms=400, max_utterance_ms=30000):
         self.vad = webrtcvad.Vad(aggressiveness)
         self.frame_ms = frame_ms
         self.hangover_frames = int(hangover_ms / frame_ms)
+        self.max_utterance_ms = max_utterance_ms  # Safety timeout for stuck utterances
         self.speaking = False
         self.consec_speech = 0
         self.non_speech = 0
         self.started_at_ms = 0
         self.min_start_frames = 2  # default ~40ms
         self.min_burst_frames = 6  # ~120ms
+        # Diagnostic counters
+        self._frame_count = 0
+        self._speech_while_speaking = 0
+        self._nonspeech_while_speaking = 0
 
     def process_frame(self, pcm16_bytes, sample_rate):
+        self._frame_count += 1
+        # Calculate RMS for frame
+        try:
+            arr = np.frombuffer(pcm16_bytes, dtype=np.int16)
+            frame_rms = float(np.sqrt(np.mean(arr.astype(np.float64)**2))) if arr.size > 0 else 0.0
+        except:
+            frame_rms = 0.0
         info = {
             'is_speech': False,
             'consec_speech': self.consec_speech,
@@ -253,12 +299,36 @@ class VADState:
             'speaking': self.speaking,
             'prestart': False,
         }
+        # Log first few frames to verify frame size
+        if self._frame_count <= 3:
+            log_event("vad_frame_info", metrics={"frame": self._frame_count, "bytes": len(pcm16_bytes), "sample_rate": sample_rate, "expected_bytes": int(sample_rate * 0.02) * 2, "rms": int(frame_rms)})
         try:
             is_speech = self.vad.is_speech(pcm16_bytes, sample_rate)
-        except Exception:
+        except Exception as e:
             is_speech = False
+            if self._frame_count <= 5:
+                log_event("vad_is_speech_error", metrics={"frame": self._frame_count, "error": str(e), "frame_bytes": len(pcm16_bytes), "sample_rate": sample_rate})
         info['is_speech'] = is_speech
         now_ms = int(time.time() * 1000)
+
+        # Track is_speech while in speaking state
+        if self.speaking:
+            if is_speech:
+                self._speech_while_speaking += 1
+            else:
+                self._nonspeech_while_speaking += 1
+            # Log every 50 frames while speaking to diagnose why 'end' never fires
+            total_speaking_frames = self._speech_while_speaking + self._nonspeech_while_speaking
+            if total_speaking_frames % 50 == 0:
+                log_event("vad_speaking_stats", metrics={
+                    "speech_frames": self._speech_while_speaking,
+                    "nonspeech_frames": self._nonspeech_while_speaking,
+                    "speech_pct": int(100 * self._speech_while_speaking / max(1, total_speaking_frames)),
+                    "current_non_speech": self.non_speech,
+                    "hangover_needed": self.hangover_frames,
+                    "frame_rms": int(frame_rms),
+                    "is_speech": is_speech,
+                })
         if not self.speaking:
             if is_speech:
                 self.consec_speech += 1
@@ -267,7 +337,11 @@ class VADState:
                     self.speaking = True
                     self.started_at_ms = now_ms
                     self.non_speech = 0
+                    # Reset diagnostic counters on new utterance
+                    self._speech_while_speaking = 0
+                    self._nonspeech_while_speaking = 0
                     info['speaking'] = True
+                    log_event("vad_start_detected", metrics={"frame": self._frame_count})
                     return 'start', now_ms, info
                 else:
                     info['prestart'] = True
@@ -276,6 +350,19 @@ class VADState:
                 info['consec_speech'] = 0
             return None, None, info
         else:
+            # Check for max utterance timeout (safety valve for stuck VAD)
+            utterance_dur_ms = now_ms - self.started_at_ms
+            if utterance_dur_ms >= self.max_utterance_ms:
+                log_event("vad_end_timeout", metrics={
+                    "dur_ms": utterance_dur_ms,
+                    "max_ms": self.max_utterance_ms,
+                    "speech_frames": self._speech_while_speaking,
+                    "nonspeech_frames": self._nonspeech_while_speaking,
+                })
+                self.speaking = False
+                self.consec_speech = 0
+                self.non_speech = 0
+                return 'end', now_ms, info
             if is_speech:
                 self.non_speech = 0
                 return None, None, info
@@ -283,6 +370,12 @@ class VADState:
                 self.non_speech += 1
                 if self.non_speech >= self.hangover_frames:
                     dur_frames = int((now_ms - self.started_at_ms) / self.frame_ms)
+                    log_event("vad_end_reached_hangover", metrics={
+                        "dur_frames": dur_frames,
+                        "min_burst": self.min_burst_frames,
+                        "speech_frames": self._speech_while_speaking,
+                        "nonspeech_frames": self._nonspeech_while_speaking,
+                    })
                     self.speaking = False
                     self.consec_speech = 0
                     self.non_speech = 0
@@ -301,6 +394,13 @@ class VADManager:
         self.stop_event = stop_event
         self.state = state
         self.vad = vad
+        # STT streaming helpers (wired from attach_candidate_vad)
+        self.stt_client = None
+        self.ring_buffer = None
+        self.frame_batcher = None
+        self._in_utterance = False
+        self._stt_continuous = os.environ.get('STT_CONTINUOUS', 'false').lower() not in ('0','false','no')
+        self._stt_suppression_until = 0  # Cooldown timestamp after suppression
         # Ensure per-utterance counters exist in state (reset at utterance start elsewhere)
         self.state.setdefault('vad_counters', {'vad_starts_total': 0, 'vad_stops_allowed': 0, 'vad_suppressed_guard': 0, 'vad_suppressed_energy': 0, 'vad_suppressed_minframes': 0})
 
@@ -314,12 +414,19 @@ class VADManager:
             'vad_suppressed_minframes': 0,
         })
         now_ms = int(time.time() * 1000)
-        # RMS profiling once per ~1s while TTS speaking
+        # Compute RMS for profiling/feature forwarding
         try:
             arr = np.frombuffer(frame, dtype=np.int16)
             rms_prof = float(np.sqrt(np.mean((arr.astype(np.float64))**2))) if arr.size > 0 else 0.0
         except Exception:
             rms_prof = 0.0
+        # Forward VAD feature (RMS) to Orchestrator if connected
+        try:
+            orch = self.state.get('orch_client')
+            if orch is not None:
+                self.loop.create_task(orch.send_feature(rms_prof))
+        except Exception:
+            pass
         if self.state.get('speaking', False):
             last_sample = self.state.get('rms_last_sample_ts', 0)
             if now_ms - int(last_sample) >= 1000:
@@ -348,12 +455,61 @@ class VADManager:
             except Exception:
                 guard_ok = True
             min_rms = float(self.state.get('local_stop_min_rms', 0) or 0)
-            payload_extra = {"rms": rms, "rms_threshold": min_rms, "guard_ok": guard_ok, "speaking_armed": self.state.get('speaking_armed', False), "speaking_armed_ts_ms": self.state.get('speaking_armed_ts_ms', 0)}
+            is_tts_active = self.state.get('speaking', False)
+            payload_extra = {"rms": rms, "rms_threshold": min_rms, "guard_ok": guard_ok, "speaking_armed": self.state.get('speaking_armed', False), "speaking_armed_ts_ms": self.state.get('speaking_armed_ts_ms', 0), "tts_active": is_tts_active}
+            # Log VAD start with context about whether we're in TTS or listening mode
+            log_event("vad_start_fired", session_id=self.session_id, metrics=payload_extra)
             # WS: vad_start
             evt = {"type": "vad_start", "ts_ms": ts, "session_id": self.session_id, "utterance_id": self.state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio", **payload_extra}}
             self.loop.call_soon_threadsafe(self.ws_queue.put_nowait, evt)
             # Gated stop
             self.state['last_vad_ts_ms'] = ts
+            # Enterprise: VAD-bounded utterance start (if not in continuous mode)
+            # Only start STT utterance if RMS meets minimum threshold (avoid noise triggers)
+            stt_min_rms = float(self.state.get('stt_min_rms', 50) or 50)  # Lower than barge-in threshold
+            # Check cooldown from previous suppression
+            in_cooldown = now_ms < self._stt_suppression_until
+            try:
+                log_event("debug_vad_start_stt_check", session_id=self.session_id, metrics={
+                    "stt_continuous": self._stt_continuous,
+                    "stt_client_exists": self.stt_client is not None,
+                    "in_utterance": self._in_utterance,
+                    "rms": int(rms),
+                    "stt_min_rms": int(stt_min_rms),
+                    "in_cooldown": in_cooldown,
+                })
+                if not self._stt_continuous and self.stt_client is not None and not self._in_utterance:
+                    # Only start utterance if RMS indicates real speech, not background noise
+                    # Strong RMS (2x threshold) can break through cooldown
+                    rms_ok = rms >= stt_min_rms and (not in_cooldown or rms >= stt_min_rms * 2)
+                    if rms_ok:
+                        self._in_utterance = True
+                        utt_id = f"utt-{int(time.time()*1000)}"
+                        self.state['active_utterance_id'] = utt_id
+                        log_event("debug_stt_starting_utterance", session_id=self.session_id, metrics={"utt_id": utt_id, "rms": int(rms)})
+                        # Flush ring pre-speech into batcher
+                        if self.ring_buffer is not None:
+                            flushed = self.ring_buffer.flush_all()
+                            if flushed:
+                                ds = downsample_48k_to_16k(flushed)
+                                if self.frame_batcher is not None:
+                                    self.frame_batcher.add(ds)
+                        self.loop.create_task(self.stt_client.start_utterance(utt_id))
+                    else:
+                        # Reset VAD state so it can fire a new 'start' when real speech comes
+                        self.vad.speaking = False
+                        self.vad.consec_speech = 0
+                        self.vad.non_speech = 0
+                        # Clear pending ring/batcher state to avoid stale audio
+                        if self.ring_buffer is not None:
+                            self.ring_buffer.flush_all()
+                        if self.frame_batcher is not None:
+                            self.frame_batcher.flush()
+                        # Set cooldown to avoid rapid re-triggers from ambient noise
+                        self._stt_suppression_until = now_ms + int(self.state.get('stt_suppression_cooldown_ms', 200) or 200)
+                        log_event("stt_start_suppressed", session_id=self.session_id, metrics={"rms": int(rms), "threshold": int(stt_min_rms), "cooldown_ms": 200})
+            except Exception as e:
+                log_event("debug_stt_start_error", session_id=self.session_id, metrics={"error": str(e)})
             if self.state.get('local_stop_enabled', True) and self.state.get('speaking_armed', False) and guard_ok and rms >= min_rms:
                 counters['vad_stops_allowed'] += 1
                 log_event("local_stop_triggered", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), metrics=payload_extra)
@@ -375,6 +531,18 @@ class VADManager:
         elif ev == 'end':
             evt = {"type": "vad_end", "ts_ms": ts, "session_id": self.session_id, "utterance_id": self.state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
             self.loop.call_soon_threadsafe(self.ws_queue.put_nowait, evt)
+            # Enterprise: VAD-bounded utterance end (if not in continuous mode)
+            try:
+                if not self._stt_continuous and self.stt_client is not None and self._in_utterance:
+                    # Flush remaining batched audio
+                    if self.frame_batcher is not None:
+                        rem = self.frame_batcher.flush()
+                        if rem:
+                            self.loop.create_task(self.stt_client.send_audio(rem))
+                    self.loop.create_task(self.stt_client.end_utterance())
+                    self._in_utterance = False
+            except Exception:
+                pass
 
 
 class TTSMetrics:
@@ -472,32 +640,132 @@ class TTSMetrics:
             payload['producer_stream_duration_ms'] = int(pe - ps)
 
 
-def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event, state):
+def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event, state,
+                         stt_client=None, ring_buffer=None, frame_batcher=None):
     """Register a candidate-audio VAD callback; bridge to asyncio with call_soon_threadsafe."""
     frame_bytes = int(48000 * 0.02) * 2  # 20ms @48k, 16-bit mono
     buf = bytearray()
     frame_count = [0]  # Use list for nonlocal mutation in nested function
     manager = VADManager(loop, ws_queue, session_id, stop_event, state, vad)
+    # Wire STT helpers to VADManager (these were passed in but never assigned)
+    manager.stt_client = stt_client
+    manager.ring_buffer = ring_buffer
+    manager.frame_batcher = frame_batcher
+
+    started_stream = [False]
+
+    # Track RMS after format conversion for diagnostics
+    processed_rms_samples = []
+    processed_rms_max = [0]
 
     def handle_frame(pcm_bytes, sample_rate=48000, channels=1):
         nonlocal buf
         frame_count[0] += 1
         # Log every 500 frames (~10 seconds) to confirm we're receiving audio
         if frame_count[0] == 1:
-            log_event("remote_audio_first_frame", metrics={"len": len(pcm_bytes), "sr": sample_rate, "ch": channels})
+            # Diagnose audio format: check if float32 vs int16
+            expected_int16_samples = len(pcm_bytes) // 2
+            expected_float32_samples = len(pcm_bytes) // 4
+            # Try both interpretations
+            try:
+                arr_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+                rms_i16 = float(np.sqrt(np.mean(arr_i16.astype(np.float64)**2))) if arr_i16.size > 0 else 0
+            except:
+                rms_i16 = -1
+            try:
+                arr_f32 = np.frombuffer(pcm_bytes, dtype=np.float32)
+                # Convert float32 [-1,1] to int16 scale for comparison
+                rms_f32_scaled = float(np.sqrt(np.mean((arr_f32 * 32767)**2))) if arr_f32.size > 0 else 0
+            except:
+                rms_f32_scaled = -1
+            log_event("remote_audio_first_frame", metrics={
+                "len": len(pcm_bytes), "sr": sample_rate, "ch": channels,
+                "rms_as_int16": int(rms_i16), "rms_as_float32": int(rms_f32_scaled),
+                "likely_format": "float32" if rms_f32_scaled > rms_i16 * 10 else "int16"
+            })
         elif frame_count[0] % 500 == 0:
             log_event("remote_audio_frames_progress", metrics={"frames": frame_count[0]})
-        # Decode remote audio frames as PCM16 (Daily VirtualSpeaker yields int16)
-        pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+        # Detect and convert audio format - Daily may send float32
+        bytes_per_sample = len(pcm_bytes) // (sample_rate * channels // 50)  # 20ms frame
+        if bytes_per_sample == 4:
+            # Float32 format - convert to int16
+            pcm_arr = np.frombuffer(pcm_bytes, dtype=np.float32)
+            pcm_arr = (pcm_arr * 32767).clip(-32768, 32767).astype(np.int16)
+        else:
+            # Assume int16
+            pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+        # Apply input gain to boost quiet audio (default 1.0 = no gain)
+        input_gain = float(os.environ.get('AUDIO_INPUT_GAIN', '1.0'))
+        if input_gain != 1.0 and pcm_arr.size > 0:
+            pcm_arr = (pcm_arr.astype(np.float32) * input_gain).clip(-32768, 32767).astype(np.int16)
         if channels == 2 and pcm_arr.size % 2 == 0:
             pcm_arr = pcm_arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
         if sample_rate != 48000 and pcm_arr.size > 0:
             pcm_arr = resample_to_48k(pcm_arr, sample_rate)
+
+        # Track RMS after all format conversions for diagnostics
+        try:
+            if pcm_arr.size > 0:
+                rms_processed = float(np.sqrt(np.mean(pcm_arr.astype(np.float64)**2)))
+                processed_rms_samples.append(rms_processed)
+                if len(processed_rms_samples) > 100:
+                    processed_rms_samples.pop(0)
+                if rms_processed > processed_rms_max[0]:
+                    processed_rms_max[0] = rms_processed
+                # Log every 100 frames with processed RMS stats
+                if frame_count[0] % 100 == 0:
+                    rms_avg = sum(processed_rms_samples) / len(processed_rms_samples) if processed_rms_samples else 0
+                    rms_recent_max = max(processed_rms_samples) if processed_rms_samples else 0
+                    log_event("audio_processed_rms", metrics={
+                        "frame": frame_count[0],
+                        "rms_current": int(rms_processed),
+                        "rms_avg_100": int(rms_avg),
+                        "rms_max_100": int(rms_recent_max),
+                        "rms_max_total": int(processed_rms_max[0]),
+                        "speaking": state.get('speaking', False)
+                    })
+        except Exception:
+            pass
+
         b = pcm_arr.tobytes()
         buf.extend(b)
         while len(buf) >= frame_bytes:
             frame = bytes(buf[:frame_bytes])
             del buf[:frame_bytes]
+            # Always push frame to ring buffer for STT
+            try:
+                if ring_buffer is not None:
+                    ring_buffer.push(frame)
+            except Exception:
+                pass
+            # Stream frame to STT sidecar
+            try:
+                if stt_client is not None and frame_batcher is not None:
+                    if manager._stt_continuous:
+                        # Continuous: single long-form utterance
+                        if not started_stream[0]:
+                            started_stream[0] = True
+                            utt = f"utt-{int(time.time()*1000)}"
+                            loop.create_task(stt_client.start_utterance(utt))
+                        ds = downsample_48k_to_16k(frame)
+                        frame_batcher.add(ds)
+                        chunk = frame_batcher.emit_ready()
+                        while chunk:
+                            loop.create_task(stt_client.send_audio(chunk))
+                            chunk = frame_batcher.emit_ready()
+                    else:
+                        # VAD-bounded: only stream during active utterance
+                        if manager._in_utterance:
+                            ds = downsample_48k_to_16k(frame)
+                            frame_batcher.add(ds)
+                            chunk = frame_batcher.emit_ready()
+                            while chunk:
+                                loop.create_task(stt_client.send_audio(chunk))
+                                chunk = frame_batcher.emit_ready()
+            except Exception:
+                pass
             manager.on_frame(frame)
 
     # Try to register callback on transport
@@ -578,6 +846,12 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
         evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
         state['tts_stop_emitted'] = True
         await ws_queue.put(evt)
+        try:
+            orch = state.get('orch_client')
+            if orch is not None:
+                await orch.send_tts_event('stopped', reason=reason)
+        except Exception:
+            pass
     # Disarm after playback completes
     state['speaking_armed'] = False
 
@@ -806,6 +1080,12 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                     evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
                     state['tts_stop_emitted'] = True
                     await ws_queue.put(evt)
+                    try:
+                        orch = state.get('orch_client')
+                        if orch is not None:
+                            await orch.send_tts_event('stopped', reason=reason)
+                    except Exception:
+                        pass
                 break
             # Check for sentinel (None) indicating producer is done
             if frm is None:
@@ -850,6 +1130,12 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                         evt = {"type": "tts_first_audio", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": {"first_audio_ms": first_audio_ms}}
                         await ws_queue.put(evt)
                         log_event("tts_first_audio", session_id=session_id or "", utterance_id=utterance_id, metrics={"first_audio_ms": first_audio_ms})
+                        try:
+                            oc = state.get('orch_client')
+                            if oc is not None:
+                                await oc.send_tts_event('first_audio', first_audio_ms=first_audio_ms)
+                        except Exception:
+                            pass
             except Exception as e:
                 log_event("tts_transport_send_error", session_id=session_id or "", utterance_id=utterance_id, metrics={"error": str(e)})
                 stop_event.set()
@@ -914,8 +1200,12 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             evt = {"type": "tts_queue_peak_frames", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": {"peak_frames": tm.queue_peak_frames}}
             with contextlib.suppress(Exception):
                 await ws_queue.put(evt)
-        # Disarm local-stop after playback concludes
+        # Disarm local-stop after playback concludes and clear stop flag for next turns
         state['speaking_armed'] = False
+        try:
+            stop_event.clear()
+        except Exception:
+            pass
 
 
 class DailyTransportWrapper(daily.EventHandler):
@@ -998,15 +1288,62 @@ class DailyTransportWrapper(daily.EventHandler):
         # and forward them into the VAD path via _on_speaker_audio.
         def _speaker_reader():
             try:
+                import numpy as np
                 sr = getattr(self.speaker, 'sample_rate', 48000) or 48000
                 ch = getattr(self.speaker, 'channels', 1) or 1
                 num_frames = int(sr / 100) * 2  # 20ms
                 self._speaker_read_errors = 0
+                self._speaker_frame_count = 0
+                self._speaker_nonzero_count = 0
+                # RMS tracking for diagnostics
+                self._rms_samples = []
+                self._rms_max = 0
                 log_event("speaker_reader_started", metrics={"sr": sr, "ch": ch, "frames_per_read": num_frames})
                 while True:
                     try:
                         data = self.speaker.read_frames(num_frames)
                         if data and self._remote_audio_callback:
+                            self._speaker_frame_count += 1
+                            # Check if data has any non-zero content
+                            if isinstance(data, bytes) and any(b != 0 for b in data[:100]):
+                                self._speaker_nonzero_count += 1
+
+                            # Calculate RMS at speaker reader level (before any processing)
+                            rms_raw = 0
+                            try:
+                                if isinstance(data, bytes):
+                                    # Try int16 interpretation
+                                    arr = np.frombuffer(data, dtype=np.int16)
+                                    if arr.size > 0:
+                                        rms_raw = float(np.sqrt(np.mean(arr.astype(np.float64)**2)))
+                                        self._rms_samples.append(rms_raw)
+                                        if len(self._rms_samples) > 100:
+                                            self._rms_samples.pop(0)
+                                        if rms_raw > self._rms_max:
+                                            self._rms_max = rms_raw
+                            except Exception:
+                                pass
+
+                            # Log every 500 frames (~10s) with RMS stats
+                            if self._speaker_frame_count == 1 or self._speaker_frame_count % 500 == 0:
+                                rms_avg = sum(self._rms_samples) / len(self._rms_samples) if self._rms_samples else 0
+                                rms_recent_max = max(self._rms_samples) if self._rms_samples else 0
+                                log_event("speaker_reader_stats", metrics={
+                                    "frames": self._speaker_frame_count,
+                                    "nonzero_frames": self._speaker_nonzero_count,
+                                    "data_len": len(data) if data else 0,
+                                    "rms_current": int(rms_raw),
+                                    "rms_avg_100": int(rms_avg),
+                                    "rms_max_100": int(rms_recent_max),
+                                    "rms_max_total": int(self._rms_max)
+                                })
+                            # Log high RMS events (potential speech)
+                            elif rms_raw > 50:
+                                log_event("speaker_high_rms", metrics={
+                                    "frame": self._speaker_frame_count,
+                                    "rms": int(rms_raw)
+                                })
+
                             # Bridge into existing callback path
                             self._remote_audio_callback(data, sample_rate=sr, channels=ch)
                         else:
@@ -1035,16 +1372,39 @@ class DailyTransportWrapper(daily.EventHandler):
         if participant.get("info", {}).get("isLocal", False):
             return
         participant_id = participant.get("id", "unknown")
-        log_event("participant_joined", metrics={"participant_id": participant_id})
+        # Log full participant info for debugging
+        info = participant.get("info", {})
+        media = participant.get("media", {})
+        log_event("participant_joined", metrics={
+            "participant_id": participant_id,
+            "user_name": info.get("userName", ""),
+            "is_owner": info.get("isOwner", False),
+            "audio_state": media.get("microphone", {}).get("state", "unknown"),
+            "camera_state": media.get("camera", {}).get("state", "unknown")
+        })
         self._user_participant_id = participant_id
         # Subscribe to this participant's media so the speaker reader receives audio frames
         try:
             self.client.update_subscriptions(participant_settings={
                 participant_id: {"media": "subscribed"}
             })
-            log_event("subscribed_media", metrics={"participant_id": participant_id})
+            # Check subscription result
+            try:
+                updated_participants = self.client.participants()
+                p_data = updated_participants.get(participant_id, {})
+                p_media = p_data.get("media", {})
+                mic_sub = p_media.get("microphone", {}).get("subscribed", "unknown")
+                mic_state = p_media.get("microphone", {}).get("state", "unknown")
+                log_event("subscribed_media", metrics={
+                    "participant_id": participant_id,
+                    "mic_subscribed": mic_sub,
+                    "mic_state": mic_state
+                })
+            except Exception:
+                log_event("subscribed_media", metrics={"participant_id": participant_id})
         except Exception as e:
             eprint(f"subscribe failed for {participant_id}: {e}")
+            log_event("subscribe_failed", metrics={"participant_id": participant_id, "error": str(e)})
         self._participant_joined_flag.set()
 
     def _check_existing_participants(self):
@@ -1210,11 +1570,21 @@ async def main():
         state['local_stop_guard_ms'] = int(os.environ.get('LOCAL_STOP_GUARD_MS', '500'))
     except Exception:
         state['local_stop_guard_ms'] = 500
-    # Minimum RMS (0-32767) to accept VAD start as real speech; default 1200 (tunable)
+    # Minimum RMS (0-32767) to accept VAD start as real speech for barge-in; default 1200 (tunable)
     try:
         state['local_stop_min_rms'] = int(os.environ.get('LOCAL_STOP_MIN_RMS', '1200'))
     except Exception:
         state['local_stop_min_rms'] = 1200
+    # Minimum RMS for STT utterance creation (lower than barge-in to capture quiet speech); default 50
+    try:
+        state['stt_min_rms'] = int(os.environ.get('STT_MIN_RMS', '50'))
+    except Exception:
+        state['stt_min_rms'] = 50
+    # Cooldown after STT suppression to avoid rapid re-triggers from ambient noise; default 200ms
+    try:
+        state['stt_suppression_cooldown_ms'] = int(os.environ.get('STT_SUPPRESSION_COOLDOWN_MS', '200'))
+    except Exception:
+        state['stt_suppression_cooldown_ms'] = 200
 
     ws_task = None
     if ws_url:
@@ -1240,10 +1610,91 @@ async def main():
         return
     log_event("bot_participant_ready", session_id=session_id or "")
 
-    # Candidate audio VAD wiring
-    vad = VADState(aggressiveness=int(os.environ.get('WORKER_VAD_AGGRESSIVENESS', '2')), frame_ms=20, hangover_ms=400)
+    # Debug: log key environment variables
+    log_event("debug_env", session_id=session_id or "", metrics={
+        "ORCH_ADDR": os.environ.get('ORCH_ADDR', '<not set>'),
+        "STT_ENABLED": os.environ.get('STT_ENABLED', '<not set>'),
+        "STT_UDS_PATH": os.environ.get('STT_UDS_PATH', '<not set>'),
+    })
+
+    # Orchestrator control: connect by default to local orchestrator unless explicitly disabled.
+    orch = None
     try:
-        attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event, state)
+        orch_addr = os.environ.get('ORCH_ADDR') or 'localhost:9090'
+        log_event("debug_orch_connecting", session_id=session_id or "", metrics={"addr": orch_addr})
+        if not session_id:
+            session_id = f"sess-{int(time.time()*1000)}"
+        orch = GatewayControlClient(session_id, loop, log_event, stop_event, state)
+        await orch.connect()
+        await orch.send_session_open(room_url)
+        state['orch_client'] = orch
+        log_event("orchestrator_connected", session_id=session_id or "", metrics={"addr": orch_addr})
+        # Wire StartTTS to TTS service client
+        tts_client = TTSClient(loop, log_event)
+        voice_id_env = os.environ.get('ELEVENLABS_VOICE_ID', '')
+
+        async def _on_start_tts(text: str):
+            log_event("orchestrator_start_tts_received", session_id=session_id or "", metrics={"text_len": len(text)})
+            # Reset state for new TTS turn
+            state['tts_stop_emitted'] = False
+            state['speaking'] = True
+            utterance_id = f"u-{int(time.time()*1000)}"
+            state['active_utterance_id'] = utterance_id
+            state['tts_started_ts_ms'] = int(time.time() * 1000)
+            # Notify orchestrator that TTS started
+            try:
+                oc = state.get('orch_client')
+                if oc is not None:
+                    await oc.send_tts_event('started')
+            except Exception:
+                pass
+            pcm = await tts_client.fetch_pcm48k(session_id or '', voice_id_env, text)
+            if pcm:
+                log_event("tts_pcm_fetched", session_id=session_id or "", metrics={"bytes": len(pcm)})
+                await playback_task(transport, pcm, 48000, stop_event, loop, ws_queue, session_id, utterance_id, state)
+            else:
+                log_event("tts_pcm_fetch_failed", session_id=session_id or "")
+            # Reset speaking state after playback
+            state['speaking'] = False
+            state['active_utterance_id'] = ''
+
+        orch.on_start_tts = _on_start_tts
+    except Exception as e:
+        log_event("orchestrator_connect_error", session_id=session_id or "", metrics={"error": str(e)})
+
+    # Candidate audio VAD wiring + STT sidecar streaming
+    vad_agg = int(os.environ.get('WORKER_VAD_AGGRESSIVENESS', '2'))
+    vad_hangover = int(os.environ.get('WORKER_VAD_HANGOVER_MS', '400'))
+    vad_max_utt = int(os.environ.get('WORKER_VAD_MAX_UTTERANCE_MS', '30000'))
+    vad = VADState(aggressiveness=vad_agg, frame_ms=20, hangover_ms=vad_hangover, max_utterance_ms=vad_max_utt)
+    log_event("vad_config", session_id=session_id or "", metrics={"aggressiveness": vad_agg, "hangover_ms": vad_hangover, "hangover_frames": vad.hangover_frames, "max_utterance_ms": vad_max_utt})
+    # Enable STT by default for E2E; allow disabling via STT_ENABLED=false
+    stt_enabled = os.environ.get('STT_ENABLED', 'true').lower() not in ('0', 'false', 'no')
+    log_event("debug_stt_config", session_id=session_id or "", metrics={
+        "stt_enabled": stt_enabled,
+        "stt_uds_path": os.environ.get('STT_UDS_PATH', '/run/app/stt.sock'),
+    })
+    stt_client = None
+    ring = RingBuffer(capacity_ms=int(os.environ.get('RING_BUFFER_MS','300')), hard_cap_ms=int(os.environ.get('RING_BUFFER_HARD_CAP_MS','500')))
+    batcher = FrameBatcher(batch_ms=int(os.environ.get('STT_BATCH_MS','100')))
+    if stt_enabled:
+        try:
+            log_event("debug_stt_creating_client", session_id=session_id or "")
+            stt_client = STTSidecarClient(session_id, loop, log_event, ws_queue)
+            if orch:
+                stt_client.attach_orchestrator(orch)
+                log_event("debug_stt_attached_orch", session_id=session_id or "")
+            log_event("debug_stt_preconnecting", session_id=session_id or "")
+            await stt_client.preconnect()
+            log_event("debug_stt_preconnected", session_id=session_id or "")
+        except Exception as e:
+            log_event("stt_error", session_id=session_id or "", metrics={"error": str(e)})
+            stt_client = None
+    else:
+        log_event("debug_stt_disabled", session_id=session_id or "")
+    try:
+        attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event, state,
+                             stt_client=stt_client, ring_buffer=ring, frame_batcher=batcher)
     except Exception as e:
         eprint("candidate audio hook unavailable:", e)
 
@@ -1282,6 +1733,13 @@ async def main():
     log_event("tts_started", session_id=session_id or "", utterance_id=utterance_id, metrics={"text_chars": len(phrase), "streaming": use_streaming})
 
     log_event("tts_playback_start", session_id=session_id or "", utterance_id=utterance_id)
+    # Notify Orchestrator that playback has started
+    try:
+        oc = state.get('orch_client')
+        if oc is not None:
+            await oc.send_tts_event('started')
+    except Exception:
+        pass
     try:
         if use_streaming:
             log_event("tts_streaming_mode", session_id=session_id or "", utterance_id=utterance_id)

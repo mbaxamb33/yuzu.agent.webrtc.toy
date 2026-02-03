@@ -36,6 +36,9 @@ help:
 	@echo "  make test-azure-openai - Test Azure OpenAI chat completion"
 	@echo "  make test-elevenlabs - Test ElevenLabs TTS (saves to testdata/tts-test.mp3)"
 	@echo "  make test-llm-service - Test LLM gRPC service (requires grpcurl, service on :9092)"
+	@echo "  make test-e2e        - Test internal pipeline: Orchestrator -> LLM -> TTS command"
+	@echo "  make full-e2e        - Full E2E: start all services, create session, open browser"
+	@echo "  make full-e2e-verbose - Full E2E with verbose logging"
 	@echo "  make proto-go    - Generate all Go gRPC stubs"
 	@echo "  make proto-py    - Generate all Python gRPC stubs into gateway/"
 	@echo "  make sidecar     - Run STT sidecar (socket: $(STT_UDS_PATH))"
@@ -50,6 +53,14 @@ help:
 	@echo "  make llm-build   - Build LLM binary to $(BIN_DIR)/llm"
 	@echo "  make tts         - Run TTS service (go run)"
 	@echo "  make tts-build   - Build TTS binary to $(BIN_DIR)/tts"
+	@echo ""
+	@echo "Diagnostic targets (for debugging E2E issues):"
+	@echo "  make diag-logs   - Tail all service logs"
+	@echo "  make diag-orch   - Tail orchestrator log only"
+	@echo "  make diag-stt    - Tail STT sidecar log only"
+	@echo "  make diag-status - Show service status (ports, log files)"
+	@echo "  make diag-flow   - Check transcript/TTS flow in logs"
+	@echo "  make diag-clear  - Clear all log files"
 
 .PHONY: proto-go
 proto-go:
@@ -218,3 +229,82 @@ health-all:
 	@echo "Orchestrator (8082): $$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8082/healthz) $$(curl -s http://localhost:8082/healthz)"
 	@echo "LLM (8083):          $$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8083/healthz) $$(curl -s http://localhost:8083/healthz)"
 	@echo "TTS (8084):          $$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8084/healthz) $$(curl -s http://localhost:8084/healthz)"
+
+.PHONY: test-e2e
+test-e2e:
+	@echo "Testing internal pipeline: Gateway(mock) -> Orchestrator -> LLM -> TTS command"
+	@echo "Requires: orchestrator (:9090), llm (:9092) running. TTS service optional."
+	@echo ""
+	@set -a && source .env && set +a && $(GO) run ./cmd/test-e2e -timeout 20s
+
+.PHONY: full-e2e
+full-e2e:
+	@bash scripts/full_e2e.sh
+
+# ============================================================================
+# Diagnostic targets for debugging E2E issues
+# ============================================================================
+
+.PHONY: diag-logs
+diag-logs:
+	@echo "Tailing all service logs. Press Ctrl+C to stop."
+	@echo "=============================================="
+	@tail -f /tmp/orchestrator.log /tmp/stt-sidecar.log /tmp/llm.log /tmp/tts.log /tmp/server.log 2>/dev/null || echo "No log files found. Run 'make full-e2e' first."
+
+.PHONY: diag-orch
+diag-orch:
+	@echo "Tailing orchestrator log..."
+	@tail -f /tmp/orchestrator.log 2>/dev/null || echo "No orchestrator log. Run 'make full-e2e' first."
+
+.PHONY: diag-stt
+diag-stt:
+	@echo "Tailing STT sidecar log..."
+	@tail -f /tmp/stt-sidecar.log 2>/dev/null || echo "No STT log. Run 'make full-e2e' first."
+
+.PHONY: diag-clear
+diag-clear:
+	@echo "Clearing all log files..."
+	@rm -f /tmp/orchestrator.log /tmp/stt-sidecar.log /tmp/llm.log /tmp/tts.log /tmp/server.log
+	@echo "Done."
+
+.PHONY: diag-status
+diag-status:
+	@echo "=== Service Status ==="
+	@echo ""
+	@echo "Ports:"
+	@for port in 8080 8081 8082 8083 8084 9090 9092 9093; do \
+		pid=$$(lsof -ti :$$port 2>/dev/null || true); \
+		if [ -n "$$pid" ]; then \
+			echo "  :$$port - PID $$pid (running)"; \
+		else \
+			echo "  :$$port - not listening"; \
+		fi; \
+	done
+	@echo ""
+	@echo "Log files:"
+	@for f in /tmp/orchestrator.log /tmp/stt-sidecar.log /tmp/llm.log /tmp/tts.log /tmp/server.log; do \
+		if [ -f "$$f" ]; then \
+			lines=$$(wc -l < "$$f" 2>/dev/null || echo 0); \
+			echo "  $$f - $$lines lines"; \
+		else \
+			echo "  $$f - not found"; \
+		fi; \
+	done
+
+.PHONY: diag-flow
+diag-flow:
+	@echo "=== Checking transcript/TTS flow in logs ==="
+	@echo ""
+	@echo "--- Orchestrator: TranscriptFinal events ---"
+	@grep -i "transcript" /tmp/orchestrator.log 2>/dev/null | tail -20 || echo "No transcript events found"
+	@echo ""
+	@echo "--- Orchestrator: StartTTS commands ---"
+	@grep -i "starttts\|start_tts" /tmp/orchestrator.log 2>/dev/null | tail -10 || echo "No StartTTS commands found"
+	@echo ""
+	@echo "--- STT Sidecar: Transcripts ---"
+	@grep -i "transcript\|final" /tmp/stt-sidecar.log 2>/dev/null | tail -10 || echo "No transcripts in STT log"
+
+.PHONY: full-e2e-verbose
+full-e2e-verbose:
+	@echo "Starting full E2E with verbose logging..."
+	@LOG_VERBOSE=true bash scripts/full_e2e.sh

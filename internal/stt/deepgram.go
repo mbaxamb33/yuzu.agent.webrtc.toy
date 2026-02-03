@@ -4,6 +4,7 @@ import (
     "context"
     "encoding/json"
     "fmt"
+    "log"
     "net/http"
     "net/url"
     "os"
@@ -33,6 +34,10 @@ type DeepgramConn struct {
     fails    []time.Time
     circuit  time.Time
     maxAge   time.Duration
+
+    // Track last interim/final text for UtteranceEnd fallback
+    lastText      string
+    lastFinalText string
 }
 
 type DGEvent struct {
@@ -130,10 +135,13 @@ func (d *DeepgramConn) connectAndPump() error {
     ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
     defer cancel()
     start := time.Now()
+    log.Printf("[deepgram] connecting to %s (apiKey len=%d)", d.url, len(d.apiKey))
     ws, _, err := websocket.Dial(ctx, d.url, &websocket.DialOptions{HTTPHeader: hdr})
     if err != nil {
+        log.Printf("[deepgram] connect error: %v", err)
         return err
     }
+    log.Printf("[deepgram] connected in %dms", time.Since(start).Milliseconds())
     metricConnectMS.Observe(float64(time.Since(start).Milliseconds()))
     metricReconnects.Inc()
     d.ws = ws
@@ -144,6 +152,8 @@ func (d *DeepgramConn) connectAndPump() error {
 
     // Start send and recv loops
     sendDone := make(chan struct{})
+    var bytesSent uint64
+    var framesSent uint64
     go func() {
         defer close(sendDone)
         for {
@@ -158,7 +168,18 @@ func (d *DeepgramConn) connectAndPump() error {
                 err := d.ws.Write(wctx, websocket.MessageBinary, b)
                 cancel()
                 if err != nil {
+                    log.Printf("[deepgram] write error: %v", err)
                     return
+                }
+                bytesSent += uint64(len(b))
+                framesSent++
+                if framesSent == 1 || framesSent%100 == 0 {
+                    // Log first 16 bytes hex for format verification
+                    hexPrefix := ""
+                    if len(b) >= 16 {
+                        hexPrefix = fmt.Sprintf(" hex[0:16]=%x", b[:16])
+                    }
+                    log.Printf("[deepgram] sent frames=%d bytes=%d%s", framesSent, bytesSent, hexPrefix)
                 }
             }
         }
@@ -192,8 +213,15 @@ func (d *DeepgramConn) connectAndPump() error {
         }
         var m map[string]any
         if err := json.Unmarshal(data, &m); err != nil {
+            log.Printf("[deepgram] JSON parse error: %v, data: %s", err, string(data[:min(200, len(data))]))
             continue
         }
+        // Debug: log full raw response (truncated)
+        rawStr := string(data)
+        if len(rawStr) > 500 {
+            rawStr = rawStr[:500] + "..."
+        }
+        log.Printf("[deepgram] recv raw: %s", rawStr)
         // Parse Deepgram results shape leniently
         // Look for results.alternatives[0].transcript and results.is_final
         typ := toString(m["type"]) // may be "Results", "UtteranceEnd", "Metadata", "Error"
@@ -210,34 +238,72 @@ func (d *DeepgramConn) connectAndPump() error {
             d.emit(DGEvent{Type: "meta", Raw: m})
             continue
         }
-        if strings.EqualFold(typ, "Results") || m["results"] != nil {
-            var results map[string]any
-            if v, ok := m["results"].(map[string]any); ok {
-                results = v
+        if strings.EqualFold(typ, "SpeechStarted") {
+            // Don't reset here - SpeechStarted can arrive immediately after a final
+            // but before we've had a chance to forward it. Reset happens on UtteranceEnd instead.
+            log.Printf("[deepgram] SpeechStarted detected (text tracking preserved)")
+        } else if strings.EqualFold(typ, "Results") || m["channel"] != nil {
+            // Deepgram puts alternatives under "channel", not "results"
+            var channel map[string]any
+            if v, ok := m["channel"].(map[string]any); ok {
+                channel = v
             }
             var alts []any
-            if results != nil {
-                if a, ok := results["alternatives"].([]any); ok {
+            if channel != nil {
+                if a, ok := channel["alternatives"].([]any); ok {
                     alts = a
                 }
             }
             text := ""
             if len(alts) > 0 {
                 if a0, ok := alts[0].(map[string]any); ok {
-                    text = toString(a0["transcript"])
+                    text = strings.TrimSpace(toString(a0["transcript"])) // Trim whitespace
                 }
             }
-            isFinal := toBool(results["is_final"]) || toBool(m["is_final"]) || strings.EqualFold(toString(m["type"]), "UtteranceEnd")
+            isFinal := toBool(m["is_final"]) || toBool(m["speech_final"])
+            log.Printf("[deepgram] parsed: text=%q is_final=%v speech_final=%v type=%v alts_len=%d",
+                text, toBool(m["is_final"]), toBool(m["speech_final"]), m["type"], len(alts))
+            // Track text for UtteranceEnd fallback
+            if text != "" {
+                d.lastText = text
+            }
             if isFinal {
-                d.emit(DGEvent{Type: "final", Text: text, Raw: m})
+                if text != "" {
+                    d.lastFinalText = text
+                    log.Printf("[deepgram] emitting FINAL source=provider text=%q", text)
+                    d.emit(DGEvent{Type: "final", Text: text, Raw: m})
+                    metricFinalEmitted.WithLabelValues("provider").Inc()
+                } else {
+                    log.Printf("[deepgram] skipping empty is_final result")
+                    metricEmptyFinalSkipped.Inc()
+                }
             } else {
                 if text != "" {
                     d.emit(DGEvent{Type: "interim", Text: text, Raw: m})
                 }
             }
         } else if strings.EqualFold(typ, "UtteranceEnd") {
-            // utterance end event
-            d.emit(DGEvent{Type: "final", Text: "", Raw: m})
+            // UtteranceEnd signals end of speech - use last known text if we haven't emitted a final yet
+            // This is a fallback in case is_final results were missed
+            fallbackText := d.lastFinalText
+            source := "provider_cached"
+            if fallbackText == "" {
+                fallbackText = d.lastText
+                source = "interim_fallback"
+            }
+            log.Printf("[deepgram] UtteranceEnd received, fallback_text=%q source=%s lastFinal=%q lastText=%q",
+                fallbackText, source, d.lastFinalText, d.lastText)
+            // Emit UtteranceEnd as final - session.go will handle deduplication
+            if fallbackText != "" {
+                d.emit(DGEvent{Type: "final", Text: fallbackText, Raw: m})
+                metricFinalEmitted.WithLabelValues(source).Inc()
+            } else {
+                log.Printf("[deepgram] UtteranceEnd with no text to emit")
+                metricEmptyFinalSkipped.Inc()
+            }
+            // Reset tracking for next utterance
+            d.lastText = ""
+            d.lastFinalText = ""
         }
     }
 }

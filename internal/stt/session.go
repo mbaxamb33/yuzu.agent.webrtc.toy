@@ -2,12 +2,15 @@ package stt
 
 import (
     "context"
+    "fmt"
+    "log"
+    "math"
     "os"
+    "strings"
     "sync"
     "time"
 
     pb "yuzu/agent/internal/stt/pb"
-    "strings"
 )
 
 // Session handles one client's stream, owning a DeepgramConn and queues.
@@ -57,6 +60,7 @@ func (s *Session) run() {
     for e := range s.dg.Events {
         switch e.Type {
         case "interim":
+            log.Printf("[stt] interim transcript session=%s text=%q", s.id, e.Text)
             s.lastInterim = e.Text
             if !s.seenFirstInterim && !s.startedAt.IsZero() {
                 s.seenFirstInterim = true
@@ -65,14 +69,25 @@ func (s *Session) run() {
             }
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Interim{Interim: &pb.TranscriptInterim{SessionId: s.id, UtteranceId: s.utterID, Text: e.Text}}}
         case "final":
-            if s.finalEmitted { continue }
+            log.Printf("[stt] final transcript received session=%s text=%q finalEmitted=%v", s.id, e.Text, s.finalEmitted)
+            // Skip empty finals and already-emitted finals
+            if e.Text == "" {
+                log.Printf("[stt] skipping empty final session=%s", s.id)
+                continue
+            }
+            if s.finalEmitted {
+                log.Printf("[stt] skipping duplicate final session=%s (already emitted)", s.id)
+                continue
+            }
             if !s.drainAt.IsZero() {
                 ms := time.Since(s.drainAt).Milliseconds()
                 if ms > 0 { metricFinalLatencyMS.Observe(float64(ms)) }
             }
+            log.Printf("[stt] FORWARDING final to gateway session=%s text=%q utterance=%s", s.id, e.Text, s.utterID)
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Final{Final: &pb.TranscriptFinal{SessionId: s.id, UtteranceId: s.utterID, Text: e.Text}}}
             s.finalEmitted = true
         case "error":
+            log.Printf("[stt] error session=%s msg=%s", s.id, e.Text)
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Error{Error: &pb.Error{SessionId: s.id, EnumCode: pb.ErrorCode_PROVIDER_ERROR, Message: e.Text}}}
         case "meta":
             // ignore or surface in future
@@ -97,14 +112,41 @@ func (s *Session) SendAudio(b []byte) {
     s.bytesIn += uint64(len(b))
     s.framesIn++
     s.lastAct = time.Now()
+    // Calculate RMS for audio level diagnostics
+    rms := calcRMS(b)
+    if s.framesIn == 1 || s.framesIn%50 == 0 {
+        log.Printf("[stt] audio session=%s frame=%d bytes=%d rms=%.0f queueLen=%d", s.id, s.framesIn, len(b), rms, s.dg.QueueLen())
+    }
+    // Save first high-RMS audio sample for format verification
+    if s.framesIn <= 500 && rms > 500 {
+        filename := fmt.Sprintf("/tmp/stt_audio_sample_%s_frame%d_rms%.0f.raw", s.id[:8], s.framesIn, rms)
+        _ = os.WriteFile(filename, b, 0644)
+        log.Printf("[stt] saved audio sample: %s", filename)
+    }
     // drop-latest policy if DG queue is congested
     ok := s.dg.Send(b)
     if !ok {
         metricDrops.Inc()
+        log.Printf("[stt] DROPPED frame=%d rms=%.0f queueLen=%d", s.framesIn, rms, s.dg.QueueLen())
     }
     metricAudioBytes.Add(float64(len(b)))
     metricFrames.Inc()
     gaugeQueueDepth.Set(float64(s.dg.QueueLen()))
+}
+
+// calcRMS computes RMS of PCM16 audio
+func calcRMS(b []byte) float64 {
+    if len(b) < 2 {
+        return 0
+    }
+    var sum float64
+    n := len(b) / 2
+    for i := 0; i < n; i++ {
+        // Little-endian int16
+        sample := int16(uint16(b[i*2]) | uint16(b[i*2+1])<<8)
+        sum += float64(sample) * float64(sample)
+    }
+    return math.Sqrt(sum / float64(n))
 }
 
 func (s *Session) Drain() {

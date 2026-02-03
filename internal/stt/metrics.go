@@ -58,4 +58,15 @@ var (
         Name: "stt_send_queue_depth",
         Help: "Current depth of provider send queue (last observed)",
     })
+
+    // Transcript handling metrics
+    metricFinalEmitted = promauto.NewCounterVec(prometheus.CounterOpts{
+        Name: "stt_final_emitted_total",
+        Help: "Final transcripts emitted by source (provider, provider_cached, interim_fallback)",
+    }, []string{"source"})
+
+    metricEmptyFinalSkipped = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "stt_empty_final_skipped_total",
+        Help: "Empty final transcripts skipped",
+    })
 )
