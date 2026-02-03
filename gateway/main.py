@@ -1767,6 +1767,7 @@ async def main():
         state['tts_stop_emitted'] = False
 
     # Stay connected for N seconds (async)
+    # When stop_event triggers (barge-in), clear it and continue to allow conversation flow
     # Reduce log noise: log at start, every 10s, and last 3s
     log_event("bot_sleep_start", session_id=session_id, metrics={"seconds": stay_s})
     for i in range(stay_s, 0, -1):
@@ -1774,7 +1775,10 @@ async def main():
             log_event("bot_sleeping", session_id=session_id, metrics={"seconds_left": i})
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=1.0)
-            break
+            # Barge-in triggered - clear event and continue waiting for orchestrator response
+            log_event("bot_barge_in_handled", session_id=session_id, metrics={"seconds_left": i})
+            stop_event.clear()
+            # Continue the loop - don't exit, wait for orchestrator to send next TTS
         except asyncio.TimeoutError:
             pass
 
