@@ -696,9 +696,11 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
             # Assume int16
             pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
 
-        # Apply input gain to boost quiet audio (default 1.0 = no gain)
+        # Apply input gain to boost quiet user audio - only when TTS is NOT active
+        # to avoid amplifying the bot's own echo during TTS playback
         input_gain = float(os.environ.get('AUDIO_INPUT_GAIN', '1.0'))
-        if input_gain != 1.0 and pcm_arr.size > 0:
+        tts_active = state.get('speaking', False)
+        if input_gain != 1.0 and pcm_arr.size > 0 and not tts_active:
             pcm_arr = (pcm_arr.astype(np.float32) * input_gain).clip(-32768, 32767).astype(np.int16)
         if channels == 2 and pcm_arr.size % 2 == 0:
             pcm_arr = pcm_arr.reshape(-1, 2).mean(axis=1).astype(np.int16)

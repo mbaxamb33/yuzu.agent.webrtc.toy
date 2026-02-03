@@ -233,8 +233,8 @@ func (d *DeepgramConn) connectAndPump() error {
             d.emit(DGEvent{Type: "error", Text: msg, Raw: m})
             continue
         }
-        if strings.EqualFold(typ, "Metadata") || m["metadata"] != nil {
-            // Connection confirmation; optional
+        if strings.EqualFold(typ, "Metadata") {
+            // Connection confirmation; optional (don't check m["metadata"] - all messages have it!)
             d.emit(DGEvent{Type: "meta", Raw: m})
             continue
         }
