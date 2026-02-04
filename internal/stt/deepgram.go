@@ -239,9 +239,10 @@ func (d *DeepgramConn) connectAndPump() error {
             continue
         }
         if strings.EqualFold(typ, "SpeechStarted") {
-            // Don't reset here - SpeechStarted can arrive immediately after a final
-            // but before we've had a chance to forward it. Reset happens on UtteranceEnd instead.
+            // SpeechStarted boundary: notify session so it can start a fresh utterance in continuous mode.
+            // Do not clear lastText/lastFinalText here; UtteranceEnd handles reset post-final.
             log.Printf("[deepgram] SpeechStarted detected (text tracking preserved)")
+            d.emit(DGEvent{Type: "speech_started", Raw: m})
         } else if strings.EqualFold(typ, "Results") || m["channel"] != nil {
             // Deepgram puts alternatives under "channel", not "results"
             var channel map[string]any
@@ -304,6 +305,8 @@ func (d *DeepgramConn) connectAndPump() error {
             // Reset tracking for next utterance
             d.lastText = ""
             d.lastFinalText = ""
+            // Signal session to reset finalEmitted so next utterance can be transcribed
+            d.emit(DGEvent{Type: "utterance_end", Raw: m})
         }
     }
 }

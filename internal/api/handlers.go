@@ -104,6 +104,10 @@ func (h *Handlers) HandleStartSession(w http.ResponseWriter, r *http.Request, id
         "ELEVENLABS_VOICE_ID":        h.cfg.Eleven.VoiceID,
         "ELEVENLABS_CANNED_PHRASE":   h.cfg.Eleven.CannedPhrase,
         "BOT_STAY_CONNECTED_SECONDS": h.cfg.Bot.StayConnectedSeconds,
+        // Ensure worker connects to orchestrator and streams STT
+        "ORCH_ADDR":                  "localhost:9090",
+        "STT_ENABLED":                "true",
+        "STT_UDS_PATH":               "/tmp/stt.sock",
     }
     // Wire backend WS for control messages (stop_tts) if configured
     if h.cfg.Worker.TokenSecret != "" {

@@ -37,13 +37,17 @@ LOG_MIN_EVENTS = set((os.environ.get("LOG_MIN_EVENTS", "") or "").split(",")) if
     "tts_producer_http_response", "tts_producer_first_chunk", "tts_producer_exception",
     "tts_prebuffer_done", "tts_consumer_underrun", "tts_stream_complete",
     "tts_pcm_fetched", "tts_pcm_fetch_failed",
+    "tts_fetch_start", "tts_fetch_connected", "tts_fetch_eof", "tts_fetch_error", "tts_fetch_exception",
     # Barge-in
     "local_stop_triggered", "vad_start_suppressed", "barge_in_detected",
     # VAD events (important for debugging user speech detection)
     "vad_start_fired", "vad_start_detected", "vad_end_reached_hangover",
     # Orchestrator/STT
     "orchestrator_connected", "orchestrator_connect_error", "orchestrator_arm_barge_in", "orchestrator_mic_to_stt",
-    "orchestrator_start_tts_received",
+    "orchestrator_start_tts_received", "orchestrator_stream_closed", "orchestrator_transcript_send_error",
+    "orchestrator_feature_send_failed", "orchestrator_feature_call_none",
+    "orchestrator_tts_event_sent", "orchestrator_tts_event_failed", "orchestrator_tts_event_call_none",
+    "orchestrator_tts_event_queued", "orchestrator_transcript_queued", "orchestrator_write_error",
     "stt_connected", "stt_error", "stt_utterance_start", "stt_audio_sent",
     "stt_transcript_final", "stt_transcript_interim",
     "stt_sending_to_orchestrator", "stt_sent_to_orchestrator", "stt_orchestrator_send_error", "stt_no_orchestrator_attached",
@@ -421,10 +425,11 @@ class VADManager:
         except Exception:
             rms_prof = 0.0
         # Forward VAD feature (RMS) to Orchestrator if connected
+        # Use run_coroutine_threadsafe since on_frame is called from audio thread
         try:
             orch = self.state.get('orch_client')
             if orch is not None:
-                self.loop.create_task(orch.send_feature(rms_prof))
+                asyncio.run_coroutine_threadsafe(orch.send_feature(rms_prof), self.loop)
         except Exception:
             pass
         if self.state.get('speaking', False):
@@ -494,7 +499,8 @@ class VADManager:
                                 ds = downsample_48k_to_16k(flushed)
                                 if self.frame_batcher is not None:
                                     self.frame_batcher.add(ds)
-                        self.loop.create_task(self.stt_client.start_utterance(utt_id))
+                        # Use run_coroutine_threadsafe since on_frame is called from audio thread
+                        asyncio.run_coroutine_threadsafe(self.stt_client.start_utterance(utt_id), self.loop)
                     else:
                         # Reset VAD state so it can fire a new 'start' when real speech comes
                         self.vad.speaking = False
@@ -532,14 +538,15 @@ class VADManager:
             evt = {"type": "vad_end", "ts_ms": ts, "session_id": self.session_id, "utterance_id": self.state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
             self.loop.call_soon_threadsafe(self.ws_queue.put_nowait, evt)
             # Enterprise: VAD-bounded utterance end (if not in continuous mode)
+            # Use run_coroutine_threadsafe since on_frame is called from audio thread
             try:
                 if not self._stt_continuous and self.stt_client is not None and self._in_utterance:
                     # Flush remaining batched audio
                     if self.frame_batcher is not None:
                         rem = self.frame_batcher.flush()
                         if rem:
-                            self.loop.create_task(self.stt_client.send_audio(rem))
-                    self.loop.create_task(self.stt_client.end_utterance())
+                            asyncio.run_coroutine_threadsafe(self.stt_client.send_audio(rem), self.loop)
+                    asyncio.run_coroutine_threadsafe(self.stt_client.end_utterance(), self.loop)
                     self._in_utterance = False
             except Exception:
                 pass
@@ -743,6 +750,7 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
             except Exception:
                 pass
             # Stream frame to STT sidecar
+            # Use run_coroutine_threadsafe since handle_frame is called from audio callback thread
             try:
                 if stt_client is not None and frame_batcher is not None:
                     if manager._stt_continuous:
@@ -750,12 +758,12 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                         if not started_stream[0]:
                             started_stream[0] = True
                             utt = f"utt-{int(time.time()*1000)}"
-                            loop.create_task(stt_client.start_utterance(utt))
+                            asyncio.run_coroutine_threadsafe(stt_client.start_utterance(utt), loop)
                         ds = downsample_48k_to_16k(frame)
                         frame_batcher.add(ds)
                         chunk = frame_batcher.emit_ready()
                         while chunk:
-                            loop.create_task(stt_client.send_audio(chunk))
+                            asyncio.run_coroutine_threadsafe(stt_client.send_audio(chunk), loop)
                             chunk = frame_batcher.emit_ready()
                     else:
                         # VAD-bounded: only stream during active utterance
@@ -764,7 +772,7 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                             frame_batcher.add(ds)
                             chunk = frame_batcher.emit_ready()
                             while chunk:
-                                loop.create_task(stt_client.send_audio(chunk))
+                                asyncio.run_coroutine_threadsafe(stt_client.send_audio(chunk), loop)
                                 chunk = frame_batcher.emit_ready()
             except Exception:
                 pass
@@ -789,7 +797,7 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
 
 
 async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, session_id, utterance_id, state):
-    """Send audio in 20ms frames with early-wake stop."""
+    """Send audio in 20ms frames with precise pacing, drift metrics, and early-wake stop."""
     bytes_per_sample = 2
     samples_per_frame = int(sr * 0.02)
     bytes_per_frame = samples_per_frame * bytes_per_sample
@@ -797,12 +805,30 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
     sent_frames = 0
     started_ms = int(time.time() * 1000)
     method = 'unknown'
+    # Precise pacing using monotonic clock
+    frame_duration = 0.02
+    next_frame_time = time.monotonic()
+    tm = TTSMetrics(state.get('tts_started_ts_ms'))
+    tm.begin_send_timing()
 
     while pos < len(pcm16_bytes):
         if stop_event.is_set():
             break
+        now = time.monotonic()
+        sleep_time = next_frame_time - now
+        if sleep_time > 0:
+            try:
+                # Only sleep if meaningful
+                if sleep_time > 0.005:
+                    await asyncio.wait_for(stop_event.wait(), timeout=sleep_time)
+            except asyncio.TimeoutError:
+                pass
+        # If we're behind, catch up without extra sleep
+        next_frame_time += frame_duration
         chunk = pcm16_bytes[pos:pos + bytes_per_frame]
         pos += bytes_per_frame
+        if not chunk:
+            break
         try:
             if hasattr(transport, 'send_audio_pcm16'):
                 transport.send_audio_pcm16(chunk, sample_rate=sr)
@@ -814,16 +840,14 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
                 raise RuntimeError('transport has no audio send method')
             sent_frames += 1
             if sent_frames == 1:
+                # Arm local-stop after first frame and record ts
                 state['speaking_armed'] = True
                 state['speaking_armed_ts_ms'] = int(time.time() * 1000)
+                log_event("tts_first_frame_sent", session_id=session_id or "", utterance_id=utterance_id, metrics={"len": len(chunk)})
+                tm.mark_first_frame_sent()
         except Exception as e:
             eprint("publish error:", e)
             raise
-        # Early-wake wait for ~20ms or until stop
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=0.02)
-        except asyncio.TimeoutError:
-            pass
 
     duration_ms = int(time.time() * 1000) - started_ms
     log_event("audio_publish_summary", metrics={
@@ -845,6 +869,8 @@ async def playback_task(transport, pcm16_bytes, sr, stop_event, loop, ws_queue, 
         vad_ts = state.get('last_vad_ts_ms')
         if reason == 'interrupted' and isinstance(vad_ts, (int, float)) and vad_ts > 0:
             payload['barge_in_ms'] = max(0, now_ts - int(vad_ts))
+        # Add drift/queue metrics for parity with streaming path (queue stats will be minimal here)
+        tm.add_to_payload_and_log(payload, session_id, utterance_id, sent_frames)
         evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
         state['tts_stop_emitted'] = True
         await ws_queue.put(evt)
@@ -1184,6 +1210,13 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
             evt = {"type": "tts_stopped", "ts_ms": now_ts, "session_id": session_id, "utterance_id": utterance_id, "payload": payload}
             state['tts_stop_emitted'] = True
             await ws_queue.put(evt)
+            # Notify orchestrator that TTS stopped
+            try:
+                orch = state.get('orch_client')
+                if orch is not None:
+                    await orch.send_tts_event('stopped', reason=reason)
+            except Exception:
+                pass
         log_event("tts_playback_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"sent_frames": sent_frames, "completed_normally": completed_normally})
     finally:
         # Cancel producer
@@ -1225,6 +1258,7 @@ class DailyTransportWrapper(daily.EventHandler):
         self._remote_audio_callback = None
         self._participant_joined_flag = threading.Event()
         self._user_participant_id = None
+        self._use_participant_audio = False  # When True, use per-participant audio instead of speaker
 
     def connect(self):
         # Create virtual microphone for sending audio (via Daily factory)
@@ -1304,6 +1338,10 @@ class DailyTransportWrapper(daily.EventHandler):
                 while True:
                     try:
                         data = self.speaker.read_frames(num_frames)
+                        # Skip speaker audio if using per-participant audio (to avoid duplicate/loopback audio)
+                        if self._use_participant_audio:
+                            time.sleep(0.02)  # Still need to drain the buffer at ~20ms intervals
+                            continue
                         if data and self._remote_audio_callback:
                             self._speaker_frame_count += 1
                             # Check if data has any non-zero content
@@ -1385,7 +1423,7 @@ class DailyTransportWrapper(daily.EventHandler):
             "camera_state": media.get("camera", {}).get("state", "unknown")
         })
         self._user_participant_id = participant_id
-        # Subscribe to this participant's media so the speaker reader receives audio frames
+        # Subscribe to this participant's media
         try:
             self.client.update_subscriptions(participant_settings={
                 participant_id: {"media": "subscribed"}
@@ -1407,6 +1445,76 @@ class DailyTransportWrapper(daily.EventHandler):
         except Exception as e:
             eprint(f"subscribe failed for {participant_id}: {e}")
             log_event("subscribe_failed", metrics={"participant_id": participant_id, "error": str(e)})
+
+        # Set up per-participant audio renderer to receive ONLY this participant's audio
+        # (not the bot's own audio loopback from the speaker)
+        try:
+            import numpy as np
+            self._participant_audio_frames = 0
+            self._participant_audio_rms_max = 0
+
+            def on_participant_audio(participant_id, audio_data, client):
+                """Called when audio is received from the remote participant.
+
+                Args:
+                    participant_id: ID of the participant (string)
+                    audio_data: AudioData with audio_frames, sample_rate, num_channels
+                    client: The Daily client object
+                """
+                if self._remote_audio_callback and audio_data:
+                    try:
+                        self._participant_audio_frames += 1
+                        frames = audio_data.audio_frames
+
+                        # Calculate RMS for logging
+                        rms = 0
+                        if frames and isinstance(frames, bytes):
+                            try:
+                                arr = np.frombuffer(frames, dtype=np.int16)
+                                if arr.size > 0:
+                                    rms = int(np.sqrt(np.mean(arr.astype(np.float64)**2)))
+                                    if rms > self._participant_audio_rms_max:
+                                        self._participant_audio_rms_max = rms
+                            except Exception:
+                                pass
+
+                        # Log first frame and periodically
+                        if self._participant_audio_frames == 1:
+                            log_event("participant_audio_first_frame", metrics={
+                                "participant_id": participant_id,
+                                "sample_rate": audio_data.sample_rate,
+                                "channels": audio_data.num_channels,
+                                "frame_len": len(frames) if frames else 0,
+                                "rms": rms
+                            })
+                        elif self._participant_audio_frames % 500 == 0:
+                            log_event("participant_audio_stats", metrics={
+                                "frames": self._participant_audio_frames,
+                                "rms": rms,
+                                "rms_max": self._participant_audio_rms_max
+                            })
+                        elif rms > 500:  # Log high RMS events (potential speech)
+                            log_event("participant_audio_speech", metrics={
+                                "frame": self._participant_audio_frames,
+                                "rms": rms
+                            })
+
+                        # audio_data is daily.AudioData with audio_frames, sample_rate, num_channels
+                        self._remote_audio_callback(
+                            frames,
+                            sample_rate=audio_data.sample_rate,
+                            channels=audio_data.num_channels
+                        )
+                    except Exception as e:
+                        eprint(f"participant audio callback error: {e}")
+
+            self.client.set_audio_renderer(participant_id, on_participant_audio)
+            self._use_participant_audio = True  # Switch to per-participant audio
+            log_event("audio_renderer_set", metrics={"participant_id": participant_id})
+        except Exception as e:
+            eprint(f"set_audio_renderer failed for {participant_id}: {e}")
+            log_event("audio_renderer_failed", metrics={"participant_id": participant_id, "error": str(e)})
+
         self._participant_joined_flag.set()
 
     def _check_existing_participants(self):
@@ -1635,30 +1743,62 @@ async def main():
         tts_client = TTSClient(loop, log_event)
         voice_id_env = os.environ.get('ELEVENLABS_VOICE_ID', '')
 
-        async def _on_start_tts(text: str):
-            log_event("orchestrator_start_tts_received", session_id=session_id or "", metrics={"text_len": len(text)})
-            # Reset state for new TTS turn
+        # Debounced, streaming TTS for LLM sentences: accumulate then stream for smoother replies
+        state['tts_accum_buf'] = []
+        state['tts_accum_task'] = None
+        try:
+            debounce_ms = int(os.environ.get('TTS_LLM_ACCUM_DEBOUNCE_MS', '200'))
+        except Exception:
+            debounce_ms = 200
+
+        async def _flush_tts_accum():
+            buf = state.get('tts_accum_buf') or []
+            state['tts_accum_buf'] = []
+            if not buf:
+                return
+            phrase_text = " ".join(buf).strip()
+            if not phrase_text:
+                return
+            # New utterance id per flush
+            utterance_id2 = f"u-{int(time.time()*1000)}"
+            state['active_utterance_id'] = utterance_id2
+            state['tts_started_ts_ms'] = int(time.time() * 1000)
             state['tts_stop_emitted'] = False
             state['speaking'] = True
-            utterance_id = f"u-{int(time.time()*1000)}"
-            state['active_utterance_id'] = utterance_id
-            state['tts_started_ts_ms'] = int(time.time() * 1000)
-            # Notify orchestrator that TTS started
+            log_event("orchestrator_start_tts_received", session_id=session_id or "", metrics={"text_len": len(phrase_text)})
+            log_event("tts_started", session_id=session_id or "", utterance_id=utterance_id2, metrics={"text_chars": len(phrase_text), "streaming": True})
+            log_event("tts_playback_start", session_id=session_id or "", utterance_id=utterance_id2)
             try:
                 oc = state.get('orch_client')
                 if oc is not None:
                     await oc.send_tts_event('started')
             except Exception:
                 pass
-            pcm = await tts_client.fetch_pcm48k(session_id or '', voice_id_env, text)
-            if pcm:
-                log_event("tts_pcm_fetched", session_id=session_id or "", metrics={"bytes": len(pcm)})
-                await playback_task(transport, pcm, 48000, stop_event, loop, ws_queue, session_id, utterance_id, state)
-            else:
-                log_event("tts_pcm_fetch_failed", session_id=session_id or "")
-            # Reset speaking state after playback
-            state['speaking'] = False
-            state['active_utterance_id'] = ''
+            try:
+                # Use streaming playback for smoother pacing
+                await tts_streaming_play(loop, transport, eleven_api_key, voice_id_env, phrase_text, stop_event, ws_queue, session_id, utterance_id2, state)
+            except Exception:
+                log_event("tts_streaming_play_error", session_id=session_id or "", utterance_id=utterance_id2)
+            finally:
+                state['speaking'] = False
+                state['active_utterance_id'] = ''
+
+        async def _on_start_tts(text: str):
+            # Accumulate short sentences briefly to avoid staccato speech
+            state.setdefault('tts_accum_buf', []).append(text)
+            t = state.get('tts_accum_task')
+            if t and not t.done():
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            async def _delayed_flush():
+                try:
+                    await asyncio.sleep(debounce_ms / 1000.0)
+                    await _flush_tts_accum()
+                except asyncio.CancelledError:
+                    return
+            state['tts_accum_task'] = asyncio.create_task(_delayed_flush())
 
         orch.on_start_tts = _on_start_tts
     except Exception as e:

@@ -69,4 +69,10 @@ var (
         Name: "stt_empty_final_skipped_total",
         Help: "Empty final transcripts skipped",
     })
+
+    // Utterance boundary metrics
+    metricUtteranceEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+        Name: "stt_utterance_events_total",
+        Help: "Utterance boundary events observed",
+    }, []string{"type"}) // speech_started, utterance_end
 )

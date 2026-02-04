@@ -36,6 +36,7 @@ type Session struct {
     drainAt time.Time
     endpointPolicy string // "provider" | "earliest"
     finalEmitted bool
+    lastFinalText string
 }
 
 func NewSession(parent context.Context, sessionID string) *Session {
@@ -70,14 +71,22 @@ func (s *Session) run() {
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Interim{Interim: &pb.TranscriptInterim{SessionId: s.id, UtteranceId: s.utterID, Text: e.Text}}}
         case "final":
             log.Printf("[stt] final transcript received session=%s text=%q finalEmitted=%v", s.id, e.Text, s.finalEmitted)
-            // Skip empty finals and already-emitted finals
-            if e.Text == "" {
+            // Skip empty finals
+            if strings.TrimSpace(e.Text) == "" {
                 log.Printf("[stt] skipping empty final session=%s", s.id)
                 continue
             }
+            // If we already emitted a final for the current utterance, decide if this is a new utterance.
             if s.finalEmitted {
-                log.Printf("[stt] skipping duplicate final session=%s (already emitted)", s.id)
-                continue
+                // If exact duplicate of last final, drop as duplicate.
+                if s.lastFinalText == e.Text {
+                    log.Printf("[stt] skipping duplicate final session=%s (same text)", s.id)
+                    continue
+                }
+                // Heuristic: treat subsequent finals as new utterances when provider boundaries are late.
+                newID := fmt.Sprintf("utt-%d", time.Now().UnixMilli())
+                log.Printf("[stt] rolling to new utterance for subsequent final; new id=%s session=%s", newID, s.id)
+                s.StartUtterance(newID)
             }
             if !s.drainAt.IsZero() {
                 ms := time.Since(s.drainAt).Milliseconds()
@@ -86,9 +95,25 @@ func (s *Session) run() {
             log.Printf("[stt] FORWARDING final to gateway session=%s text=%q utterance=%s", s.id, e.Text, s.utterID)
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Final{Final: &pb.TranscriptFinal{SessionId: s.id, UtteranceId: s.utterID, Text: e.Text}}}
             s.finalEmitted = true
+            s.lastFinalText = e.Text
         case "error":
             log.Printf("[stt] error session=%s msg=%s", s.id, e.Text)
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Error{Error: &pb.Error{SessionId: s.id, EnumCode: pb.ErrorCode_PROVIDER_ERROR, Message: e.Text}}}
+        case "utterance_end":
+            // Reset gating so subsequent utterances can be transcribed
+            log.Printf("[stt] utterance_end received, resetting gating session=%s (finalEmitted was %v)", s.id, s.finalEmitted)
+            s.finalEmitted = false
+            s.lastInterim = ""
+            s.seenFirstInterim = false
+            s.startedAt = time.Now()
+            s.lastFinalText = ""
+            metricUtteranceEvents.WithLabelValues("utterance_end").Inc()
+        case "speech_started":
+            // Start a new utterance in continuous mode to ensure fresh utterance_id and per-utterance metrics
+            newID := fmt.Sprintf("utt-%d", time.Now().UnixMilli())
+            log.Printf("[stt] speech_started: starting new utterance id=%s session=%s", newID, s.id)
+            s.StartUtterance(newID)
+            metricUtteranceEvents.WithLabelValues("speech_started").Inc()
         case "meta":
             // ignore or surface in future
         }

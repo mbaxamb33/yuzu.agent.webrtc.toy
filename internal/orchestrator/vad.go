@@ -28,6 +28,7 @@ func (s *Server) handleFeaturePrimary(st *sessionState, rms float64, now time.Ti
 	if !st.speaking {
 		if now.Before(st.guardUntil) && rms >= st.minRMS {
 			metricBargeInGuardBlocks.Inc()
+			log.Printf("[orch] barge-in guard blocked sid=%s rms=%.1f minRMS=%.1f guard_remaining=%dms", sid, rms, st.minRMS, st.guardUntil.Sub(now).Milliseconds())
 			return false
 		}
 		if rms >= st.minRMS {
@@ -38,12 +39,15 @@ func (s *Server) handleFeaturePrimary(st *sessionState, rms float64, now time.Ti
 				st.lastFeatureStart = now
 				metricVADStarts.Inc()
 
-				// Barge-in: stop TTS
-				s.sendCmd(stream, &gw.OrchestratorCommand{
-					SessionId: sid,
-					Cmd:       &gw.OrchestratorCommand_StopTts{StopTts: &gw.StopTTS{Reason: "barge_in"}},
-				})
-				metricBargeIn.Inc()
+				log.Printf("[orch] BARGE-IN TRIGGERED sid=%s rms=%.1f minRMS=%.1f consec=%d", sid, rms, st.minRMS, st.consecSpeech)
+
+                // Barge-in: stop TTS
+                s.sendCmd(stream, &gw.OrchestratorCommand{
+                    SessionId: sid,
+                    Cmd:       &gw.OrchestratorCommand_StopTts{StopTts: &gw.StopTTS{Reason: "barge_in"}},
+                })
+                metricBargeIn.Inc()
+                metricBargeInTotal.Inc()
 
 				// Cancel active LLM
 				s.cancelLLM(st)
@@ -111,12 +115,13 @@ func (s *Server) processGatewayVAD(st *sessionState, now time.Time, sid string, 
 // handleGatewayVADPrimary drives VAD from gateway events as primary source.
 // Returns true (always triggers barge-in when called as primary).
 func (s *Server) handleGatewayVADPrimary(st *sessionState, now time.Time, sid string, stream gw.GatewayControl_SessionServer) bool {
-	// Stop TTS
-	s.sendCmd(stream, &gw.OrchestratorCommand{
-		SessionId: sid,
-		Cmd:       &gw.OrchestratorCommand_StopTts{StopTts: &gw.StopTTS{Reason: "barge_in"}},
-	})
-	metricBargeIn.Inc()
+    // Stop TTS
+    s.sendCmd(stream, &gw.OrchestratorCommand{
+        SessionId: sid,
+        Cmd:       &gw.OrchestratorCommand_StopTts{StopTts: &gw.StopTTS{Reason: "barge_in"}},
+    })
+    metricBargeIn.Inc()
+    metricBargeInTotal.Inc()
 
 	// Cancel active LLM
 	s.cancelLLM(st)

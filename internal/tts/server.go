@@ -18,6 +18,8 @@ func NewServer() *Server { return &Server{} }
 
 func (s *Server) Session(stream pb.TTS_SessionServer) error {
     parent := stream.Context()
+    startTime := time.Now()
+
     // Expect StartRequest then stream audio chunks
     msg, err := stream.Recv()
     if err != nil { return err }
@@ -26,35 +28,76 @@ func (s *Server) Session(stream pb.TTS_SessionServer) error {
     _ = stream.Send(&pb.ServerMessage{Msg: &pb.ServerMessage_Connected{Connected: &pb.Connected{SessionId: start.GetSessionId()}}})
 
     apiKey := os.Getenv("ELEVENLABS_API_KEY")
-    if apiKey == "" { _ = stream.Send(&pb.ServerMessage{Msg: &pb.ServerMessage_Error{Error: &pb.Error{Code:"config", Message:"missing ELEVENLABS_API_KEY"}}}); return nil }
+    if apiKey == "" {
+        ttsSynthesisTotal.WithLabelValues("config_error").Inc()
+        _ = stream.Send(&pb.ServerMessage{Msg: &pb.ServerMessage_Error{Error: &pb.Error{Code:"config", Message:"missing ELEVENLABS_API_KEY"}}})
+        return nil
+    }
 
     // Build request to ElevenLabs (non-streaming REST)
-    url := fmt.Sprintf("https://api.elevenlabs.io/v1/text-to-speech/%s", start.GetVoiceId())
+    // Request PCM 16-bit 48kHz mono format directly
+    url := fmt.Sprintf("https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=pcm_48000", start.GetVoiceId())
     body := map[string]any{"text": start.GetText()}
     reqBytes, _ := json.Marshal(body)
     req, err := http.NewRequestWithContext(parent, http.MethodPost, url, bytes.NewReader(reqBytes))
-    if err != nil { return err }
+    if err != nil {
+        ttsSynthesisTotal.WithLabelValues("request_error").Inc()
+        return err
+    }
     req.Header.Set("xi-api-key", apiKey)
     req.Header.Set("accept", "audio/wav")
     req.Header.Set("content-type", "application/json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return err }
-    defer resp.Body.Close()
-    if resp.StatusCode/100 != 2 { b,_ := io.ReadAll(io.LimitReader(resp.Body,1024)); _ = stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Error{Error:&pb.Error{Code:"http", Message:fmt.Sprintf("status=%d body=%s",resp.StatusCode,string(b))}}}); return nil }
 
-    // Decode WAV header and stream PCM16@48k 20ms frames
-    pcm, err := readWAVPCM16(resp.Body)
-    if err != nil { _ = stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Error{Error:&pb.Error{Code:"decode", Message:err.Error()}}}); return nil }
+    apiStart := time.Now()
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        ttsSynthesisTotal.WithLabelValues("http_error").Inc()
+        return err
+    }
+    defer resp.Body.Close()
+    ttsElevenLabsLatencyMS.Observe(float64(time.Since(apiStart).Milliseconds()))
+
+    if resp.StatusCode/100 != 2 {
+        ttsSynthesisTotal.WithLabelValues("api_error").Inc()
+        b,_ := io.ReadAll(io.LimitReader(resp.Body,1024))
+        _ = stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Error{Error:&pb.Error{Code:"http", Message:fmt.Sprintf("status=%d body=%s",resp.StatusCode,string(b))}}})
+        return nil
+    }
+
+    // Read raw PCM16@48k bytes (ElevenLabs pcm_48000 format is raw 16-bit mono PCM)
+    pcm, err := io.ReadAll(resp.Body)
+    if err != nil {
+        ttsSynthesisTotal.WithLabelValues("decode_error").Inc()
+        _ = stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Error{Error:&pb.Error{Code:"decode", Message:err.Error()}}})
+        return nil
+    }
+    if len(pcm) == 0 {
+        ttsSynthesisTotal.WithLabelValues("empty_response").Inc()
+        _ = stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Error{Error:&pb.Error{Code:"empty", Message:"empty audio response"}}})
+        return nil
+    }
+
     frameBytes := 48000/50*2 // 20ms * 48000 * 2 bytes
     pos := 0
+    firstFrame := true
     for pos < len(pcm) {
         end := pos + frameBytes
         if end > len(pcm) { end = len(pcm) }
         chunk := pcm[pos:end]
         pos = end
-        if err := stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Audio{Audio:&pb.AudioChunk{Pcm48K: chunk}}}); err != nil { return nil }
+        if err := stream.Send(&pb.ServerMessage{Msg:&pb.ServerMessage_Audio{Audio:&pb.AudioChunk{Pcm48K: chunk}}}); err != nil {
+            ttsSynthesisTotal.WithLabelValues("stream_error").Inc()
+            return nil
+        }
+        if firstFrame {
+            ttsFirstFrameMS.Observe(float64(time.Since(startTime).Milliseconds()))
+            firstFrame = false
+        }
         time.Sleep(20*time.Millisecond)
     }
+
+    ttsTotalDurationMS.Observe(float64(time.Since(startTime).Milliseconds()))
+    ttsSynthesisTotal.WithLabelValues("success").Inc()
     return nil
 }
 

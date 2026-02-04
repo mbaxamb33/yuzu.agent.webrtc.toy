@@ -3,6 +3,7 @@ package stt
 import (
     "context"
     "fmt"
+    "log"
     "os"
     "sync"
     "time"
@@ -63,12 +64,14 @@ func (s *STTServer) Session(stream pb.STT_SessionServer) error {
         case *pb.ClientMessage_Start:
             sessionID = m.Start.GetSessionId()
             utterID := m.Start.GetUtteranceId()
+            log.Printf("[stt] start utterance session=%s utterance=%s", sessionID, utterID)
             s.mu.Lock()
             sess = s.sess[sessionID]
             if sess == nil {
                 sess = NewSession(ctx, sessionID)
                 s.sess[sessionID] = sess
                 gaugeSessions.Inc()
+                log.Printf("[stt] new session created session=%s", sessionID)
             }
             s.mu.Unlock()
             sess.StartUtterance(utterID)
@@ -80,8 +83,13 @@ func (s *STTServer) Session(stream pb.STT_SessionServer) error {
             b := m.Audio.GetPcm16K()
             bytesIn += uint64(len(b))
             framesIn++
+            if framesIn == 1 || framesIn%100 == 0 {
+                log.Printf("[stt] audio frame=%d bytes=%d sess_exists=%v", framesIn, len(b), sess != nil)
+            }
             if sess != nil && len(b) > 0 {
                 sess.SendAudio(b)
+            } else if sess == nil {
+                log.Printf("[stt] audio dropped: no session yet frame=%d", framesIn)
             }
             if time.Since(lastMet) >= time.Second || framesIn%10 == 0 {
                 send(&pb.ServerMessage{Msg: &pb.ServerMessage_Metrics{Metrics: &pb.Metrics{SessionId: sessionID, BytesSent: bytesIn, FramesSent: framesIn}}})

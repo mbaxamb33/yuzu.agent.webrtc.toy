@@ -75,6 +75,7 @@ func (s *Server) Session(stream gw.GatewayControl_SessionServer) error {
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
+			log.Printf("[orch] session stream.Recv error: %v", err)
 			return err
 		}
 

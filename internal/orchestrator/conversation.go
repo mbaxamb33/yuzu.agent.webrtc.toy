@@ -63,11 +63,15 @@ func (s *Server) startLLM(parent context.Context, sessionID string, userText str
         apiVersion = "2024-02-15-preview"
     }
 	sys := os.Getenv("LLM_SYSTEM_PROMPT")
+	if sys == "" {
+		// Default TTS-friendly prompt: concise, conversational, no formatting
+		sys = "You are a friendly voice assistant. Respond in 1-2 short sentences. " +
+			"Be conversational and natural. Never use bullet points, lists, markdown, " +
+			"or special formatting. Your responses will be spoken aloud via text-to-speech."
+	}
 
 	msgs := []*llmpb.ChatMessage{}
-	if sys != "" {
-		msgs = append(msgs, &llmpb.ChatMessage{Role: "system", Content: sys})
-	}
+	msgs = append(msgs, &llmpb.ChatMessage{Role: "system", Content: sys})
 	msgs = append(msgs, &llmpb.ChatMessage{Role: "user", Content: userText})
 
 	ctx, cancel := context.WithCancel(parent)

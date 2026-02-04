@@ -61,4 +61,20 @@ var (
         Help:    "When gateway VAD is primary, time until feature VAD agrees (ms)",
         Buckets: prometheus.ExponentialBuckets(5, 1.6, 12),
     })
+
+    metricLLMReconnects = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "orch_llm_reconnects_total",
+        Help: "Total LLM client reconnects",
+    })
+
+    metricBargeInTotal = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "orch_barge_in_total",
+        Help: "Total barge-in events triggered by Orchestrator",
+    })
+
+    metricLLMSentenceLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+        Name:    "orch_llm_sentence_latency_ms",
+        Help:    "Latency from transcript final to first LLM sentence emitted",
+        Buckets: prometheus.ExponentialBuckets(50, 1.6, 12),
+    })
 )

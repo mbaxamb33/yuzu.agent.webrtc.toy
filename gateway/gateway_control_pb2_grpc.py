@@ -36,8 +36,8 @@ class GatewayControlStub(object):
         """
         self.Session = channel.stream_stream(
                 '/gateway.v1.GatewayControl/Session',
-                request_serializer=gateway__control__pb2.GatewayEvent.SerializeToString,
-                response_deserializer=gateway__control__pb2.OrchestratorCommand.FromString,
+                request_serializer=gateway_control__pb2.GatewayEvent.SerializeToString,
+                response_deserializer=gateway_control__pb2.OrchestratorCommand.FromString,
                 _registered_method=True)
 
 

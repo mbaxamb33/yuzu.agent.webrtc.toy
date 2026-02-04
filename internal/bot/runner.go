@@ -76,9 +76,10 @@ func (r *LocalRunner) Start(sessionID string, env map[string]string) error {
 	r.procs[sessionID] = &proc{cmd: nil, cancel: cancel}
 	r.mu.Unlock()
 
-	// Start with current environment, then add ours
-	cmd.Env = append(cmd.Env, envFromOS()...)
-	cmd.Env = append(cmd.Env, envToList(env)...)
+    // Start with current environment but ensure our overrides take effect.
+    // Duplicated keys in POSIX env are ambiguous; some libc implementations return the first.
+    // Merge so there is a single value per key, preferring our provided env.
+    cmd.Env = mergeEnv(envFromOS(), env)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -168,6 +169,30 @@ func envFromOS() []string {
 	out := make([]string, len(base))
 	copy(out, base)
 	return out
+}
+
+// mergeEnv merges base environment (list of KEY=VAL) with extra overrides.
+// Returns a de-duplicated list where keys from extra take precedence.
+func mergeEnv(base []string, extra map[string]string) []string {
+    m := make(map[string]string, len(base)+len(extra))
+    // Parse base into map; later extras will override
+    for _, kv := range base {
+        if kv == "" { continue }
+        if i := strings.IndexByte(kv, '='); i > 0 {
+            k := kv[:i]
+            v := kv[i+1:]
+            m[k] = v
+        }
+    }
+    for k, v := range extra {
+        m[k] = v
+    }
+    // Rebuild list
+    out := make([]string, 0, len(m))
+    for k, v := range m {
+        out = append(out, k+"="+v)
+    }
+    return out
 }
 
 func (r *LocalRunner) stream(sessionID, stream string, rdr interface{ Read([]byte) (int, error) }) {

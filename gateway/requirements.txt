@@ -5,3 +5,4 @@ pipecat-ai
 websockets==11.0.3
 webrtcvad==2.0.10
 daily-python>=0.10.0
+grpcio>=1.60.0
