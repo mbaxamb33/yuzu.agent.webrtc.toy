@@ -459,9 +459,31 @@ class VADManager:
                     self.state['guard_elapsed_logged'] = True
             except Exception:
                 guard_ok = True
+            # Baseline threshold
             min_rms = float(self.state.get('local_stop_min_rms', 0) or 0)
-            is_tts_active = self.state.get('speaking', False)
-            payload_extra = {"rms": rms, "rms_threshold": min_rms, "guard_ok": guard_ok, "speaking_armed": self.state.get('speaking_armed', False), "speaking_armed_ts_ms": self.state.get('speaking_armed_ts_ms', 0), "tts_active": is_tts_active}
+            is_tts_active = bool(self.state.get('speaking', False))
+            # Dynamic ambient-relative threshold while TTS is active
+            dyn_thresh = min_rms
+            if is_tts_active:
+                try:
+                    rms_vals = self.state.get('rms_samples') or []
+                    if rms_vals:
+                        vv = sorted(rms_vals)
+                        k = max(0, min(len(vv)-1, int(round(0.9*(len(vv)-1)))))
+                        p90 = float(vv[k])
+                        dyn_thresh = max(min_rms, p90 * 1.5 + 200.0)
+                except Exception:
+                    dyn_thresh = min_rms
+            # Dual-signal agreement: require a recent interim while speaking (optional)
+            require_interim = os.environ.get('LOCAL_STOP_REQUIRE_INTERIM', 'true').lower() not in ('0','false','no')
+            interim_ok = True
+            if require_interim and is_tts_active:
+                last_interim_ts = int(self.state.get('stt_last_interim_ts_ms', 0) or 0)
+                last_interim_len = int(self.state.get('stt_last_interim_len', 0) or 0)
+                interim_win_ms = int(os.environ.get('LOCAL_STOP_INTERIM_WINDOW_MS', '600'))
+                min_interim_len = int(os.environ.get('LOCAL_STOP_MIN_INTERIM_LEN', '10'))
+                interim_ok = (now_ms - last_interim_ts) <= interim_win_ms and last_interim_len >= min_interim_len
+            payload_extra = {"rms": int(rms), "rms_threshold": int(min_rms), "dyn_threshold": int(dyn_thresh), "guard_ok": guard_ok, "speaking_armed": self.state.get('speaking_armed', False), "speaking_armed_ts_ms": self.state.get('speaking_armed_ts_ms', 0), "tts_active": is_tts_active, "interim_ok": interim_ok}
             # Log VAD start with context about whether we're in TTS or listening mode
             log_event("vad_start_fired", session_id=self.session_id, metrics=payload_extra)
             # WS: vad_start
@@ -516,7 +538,11 @@ class VADManager:
                         log_event("stt_start_suppressed", session_id=self.session_id, metrics={"rms": int(rms), "threshold": int(stt_min_rms), "cooldown_ms": 200})
             except Exception as e:
                 log_event("debug_stt_start_error", session_id=self.session_id, metrics={"error": str(e)})
-            if self.state.get('local_stop_enabled', True) and self.state.get('speaking_armed', False) and guard_ok and rms >= min_rms:
+            if (self.state.get('local_stop_enabled', True)
+                and self.state.get('speaking_armed', False)
+                and guard_ok
+                and rms >= dyn_thresh
+                and interim_ok):
                 counters['vad_stops_allowed'] += 1
                 log_event("local_stop_triggered", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), metrics=payload_extra)
                 try:
@@ -531,9 +557,12 @@ class VADManager:
                 if not guard_ok:
                     counters['vad_suppressed_guard'] += 1
                     log_event("vad_start_suppressed", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), reason="guard", metrics=payload_extra)
-                elif rms < min_rms:
+                elif rms < dyn_thresh:
                     counters['vad_suppressed_energy'] += 1
                     log_event("vad_start_suppressed", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), reason="energy", metrics=payload_extra)
+                elif not interim_ok:
+                    counters['vad_suppressed_energy'] += 1
+                    log_event("vad_start_suppressed", session_id=self.session_id, utterance_id=self.state.get('active_utterance_id', ''), reason="interim", metrics=payload_extra)
         elif ev == 'end':
             evt = {"type": "vad_end", "ts_ms": ts, "session_id": self.session_id, "utterance_id": self.state.get('active_utterance_id', ''), "payload": {"source": "candidate_audio"}}
             self.loop.call_soon_threadsafe(self.ws_queue.put_nowait, evt)
@@ -759,8 +788,16 @@ def attach_candidate_vad(transport, ws_queue, session_id, loop, vad, stop_event,
                             started_stream[0] = True
                             utt = f"utt-{int(time.time()*1000)}"
                             asyncio.run_coroutine_threadsafe(stt_client.start_utterance(utt), loop)
-                        ds = downsample_48k_to_16k(frame)
-                        frame_batcher.add(ds)
+                        # Silence gating when not in VAD utterance to avoid filling provider queue with near-zero frames
+                        stt_silence_floor = int(os.environ.get('STT_SILENCE_RMS_FLOOR', '20'))
+                        try:
+                            arrf = np.frombuffer(frame, dtype=np.int16)
+                            frms = float(np.sqrt(np.mean(arrf.astype(np.float64)**2))) if arrf.size > 0 else 0.0
+                        except Exception:
+                            frms = 0.0
+                        if manager._in_utterance or frms >= stt_silence_floor:
+                            ds = downsample_48k_to_16k(frame)
+                            frame_batcher.add(ds)
                         chunk = frame_batcher.emit_ready()
                         while chunk:
                             asyncio.run_coroutine_threadsafe(stt_client.send_audio(chunk), loop)
@@ -1063,7 +1100,7 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
     prod_fut = loop.run_in_executor(None, start_producer)
 
     # Prebuffer 10-25 frames (200-500ms) to smooth network jitter
-    prebuffer_target = int(os.environ.get('TTS_PREBUFFER_FRAMES', '15'))
+    prebuffer_target = int(os.environ.get('TTS_PREBUFFER_FRAMES', str(state.get('tts_prebuffer_frames_next', 15))))
     prebuffer_target = max(10, min(25, prebuffer_target))
     prebuffer_timeout_secs = int(os.environ.get('TTS_PREBUFFER_TIMEOUT_SECS', '30'))
     log_event("tts_prebuffer_wait", session_id=session_id or "", utterance_id=utterance_id, metrics={"target_frames": prebuffer_target, "timeout_s": prebuffer_timeout_secs})
@@ -1219,6 +1256,17 @@ async def tts_streaming_play(loop, transport, eleven_api_key, voice_id, text, st
                 pass
         log_event("tts_playback_done", session_id=session_id or "", utterance_id=utterance_id, metrics={"sent_frames": sent_frames, "completed_normally": completed_normally})
     finally:
+        # Adapt prebuffer for next utterance based on underruns
+        try:
+            nxt = prebuffer_target
+            if tm.underruns > 0:
+                nxt = min(25, prebuffer_target + 2)
+            else:
+                nxt = max(10, prebuffer_target - 1)
+            state['tts_prebuffer_frames_next'] = nxt
+            log_event("tts_prebuffer_adapt", session_id=session_id or "", utterance_id=utterance_id, metrics={"this": prebuffer_target, "next": nxt, "underruns": tm.underruns})
+        except Exception:
+            pass
         # Cancel producer
         stop_flag.set()
         with contextlib.suppress(Exception):
@@ -1674,12 +1722,13 @@ async def main():
     stop_event = asyncio.Event()
     # Shared worker state for local-stop logic (init early so WS policy can update it)
     state = {'speaking': False, 'active_utterance_id': '', 'last_vad_ts_ms': 0, 'tts_stop_emitted': False}
+    state['last_activity_ms'] = int(time.time() * 1000)
     state['local_stop_enabled'] = os.environ.get('LOCAL_STOP_ENABLED', 'true').lower() not in ('0', 'false', 'no')
     # Guard to avoid barge-in before users hear anything; default 500ms (tunable)
     try:
-        state['local_stop_guard_ms'] = int(os.environ.get('LOCAL_STOP_GUARD_MS', '500'))
+        state['local_stop_guard_ms'] = int(os.environ.get('LOCAL_STOP_GUARD_MS', '1200'))
     except Exception:
-        state['local_stop_guard_ms'] = 500
+        state['local_stop_guard_ms'] = 1200
     # Minimum RMS (0-32767) to accept VAD start as real speech for barge-in; default 1200 (tunable)
     try:
         state['local_stop_min_rms'] = int(os.environ.get('LOCAL_STOP_MIN_RMS', '1200'))
@@ -1786,6 +1835,8 @@ async def main():
         async def _on_start_tts(text: str):
             # Accumulate short sentences briefly to avoid staccato speech
             state.setdefault('tts_accum_buf', []).append(text)
+            # Mark activity on LLM sentence
+            state['last_activity_ms'] = int(time.time() * 1000)
             t = state.get('tts_accum_task')
             if t and not t.done():
                 try:
@@ -1822,7 +1873,7 @@ async def main():
     if stt_enabled:
         try:
             log_event("debug_stt_creating_client", session_id=session_id or "")
-            stt_client = STTSidecarClient(session_id, loop, log_event, ws_queue)
+            stt_client = STTSidecarClient(session_id, loop, log_event, ws_queue, state)
             if orch:
                 stt_client.attach_orchestrator(orch)
                 log_event("debug_stt_attached_orch", session_id=session_id or "")
@@ -1851,9 +1902,9 @@ async def main():
     state['speaking_armed'] = False  # only arm after first audio is sent
     # Require multiple consecutive speech frames while TTS is active to reduce false positives
     try:
-        vad_start_frames_during_tts = int(os.environ.get('WORKER_VAD_MIN_START_FRAMES_WHILE_TTS', '4'))
+        vad_start_frames_during_tts = int(os.environ.get('WORKER_VAD_MIN_START_FRAMES_WHILE_TTS', '10'))
     except Exception:
-        vad_start_frames_during_tts = 4
+        vad_start_frames_during_tts = 10
     vad.min_start_frames = max(1, vad_start_frames_during_tts)
     # Reset per-utterance counters and RMS profiling
     state['vad_counters'] = {'vad_starts_total': 0, 'vad_stops_allowed': 0, 'vad_suppressed_guard': 0, 'vad_suppressed_energy': 0, 'vad_suppressed_minframes': 0}
@@ -1906,19 +1957,37 @@ async def main():
         vad.min_start_frames = 2  # restore default when not speaking
         state['tts_stop_emitted'] = False
 
-    # Stay connected for N seconds (async)
-    # When stop_event triggers (barge-in), clear it and continue to allow conversation flow
-    # Reduce log noise: log at start, every 10s, and last 3s
-    log_event("bot_sleep_start", session_id=session_id, metrics={"seconds": stay_s})
-    for i in range(stay_s, 0, -1):
-        if i == stay_s or i % 10 == 0 or i <= 3:
-            log_event("bot_sleeping", session_id=session_id, metrics={"seconds_left": i})
+    # Stay alive while conversation is active or until idle timeout expires
+    # BOT_STAY_CONNECTED_SECONDS remains a hard cap if set high; BOT_IDLE_EXIT_SECONDS controls idle-based exit
+    idle_exit_s = int(os.environ.get('BOT_IDLE_EXIT_SECONDS', '60'))
+    idle_log_next = 0
+    log_event("bot_sleep_start", session_id=session_id, metrics={"idle_exit_s": idle_exit_s})
+    start_ts = time.time()
+    while True:
+        now = time.time()
+        # Never exit while actively speaking or with an active utterance
+        if state.get('speaking') or state.get('active_utterance_id'):
+            state['last_activity_ms'] = int(now * 1000)
+        # Compute idle seconds since last activity
+        last_ms = int(state.get('last_activity_ms', int(now * 1000)))
+        idle_for = max(0, int(now - (last_ms / 1000)))
+        # Optional hard cap: respect BOT_STAY_CONNECTED_SECONDS if configured
+        if stay_s > 0 and (now - start_ts) >= stay_s and idle_for >= idle_exit_s and not state.get('speaking'):
+            break
+        # Idle-based exit
+        if idle_for >= idle_exit_s and not state.get('speaking') and not state.get('active_utterance_id'):
+            break
+        # Periodic idle updates
+        if int(now) >= idle_log_next:
+            log_event("bot_idle_status", session_id=session_id, metrics={"idle_for_s": idle_for, "idle_exit_s": idle_exit_s, "speaking": state.get('speaking', False)})
+            idle_log_next = int(now) + 10
+        # Wait 1s or until barge-in
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=1.0)
-            # Barge-in triggered - clear event and continue waiting for orchestrator response
-            log_event("bot_barge_in_handled", session_id=session_id, metrics={"seconds_left": i})
+            # Barge-in triggered: mark activity and clear to allow next loop
+            state['last_activity_ms'] = int(time.time() * 1000)
+            log_event("bot_barge_in_handled", session_id=session_id)
             stop_event.clear()
-            # Continue the loop - don't exit, wait for orchestrator to send next TTS
         except asyncio.TimeoutError:
             pass
 

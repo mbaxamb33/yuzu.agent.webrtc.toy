@@ -11,11 +11,12 @@ except Exception:
 
 
 class STTSidecarClient:
-    def __init__(self, session_id: Optional[str], loop: asyncio.AbstractEventLoop, log: Callable, ws_queue: Optional[asyncio.Queue] = None):
+    def __init__(self, session_id: Optional[str], loop: asyncio.AbstractEventLoop, log: Callable, ws_queue: Optional[asyncio.Queue] = None, state: Optional[dict] = None):
         self.session_id = session_id or ""
         self._loop = loop
         self._log = log
         self._ws_queue = ws_queue
+        self._state = state if state is not None else {}
         self._channel = None
         self._stub = None
         self._call = None
@@ -89,6 +90,12 @@ class STTSidecarClient:
                 which = resp.WhichOneof('msg')
                 if which == 'interim':
                     text = resp.interim.text
+                    # Update recent interim state for local-stop dual-signal gating
+                    try:
+                        self._state['stt_last_interim_ts_ms'] = int(asyncio.get_running_loop().time() * 1000)
+                        self._state['stt_last_interim_len'] = len(text)
+                    except Exception:
+                        pass
                     if self._orch is not None:
                         try:
                             await self._orch.send_transcript_interim(resp.interim.utterance_id, text)
@@ -116,4 +123,3 @@ class STTSidecarClient:
             return
         except Exception as e:
             self._log("stt_error", session_id=self.session_id, metrics={"error": str(e)})
-

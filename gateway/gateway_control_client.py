@@ -255,10 +255,16 @@ class GatewayControlClient:
             self._call = None
 
     async def _feature_loop(self):
-        """Periodic sender for coalesced features at ~10Hz (configurable)."""
+        """Periodic sender for coalesced features with dynamic rate (~10Hz idle, slower while speaking)."""
         try:
-            interval = max(0.05, float(self._feature_interval_sec))
+            base_interval = max(0.05, float(self._feature_interval_sec))
+            speak_interval = float(os.environ.get('ORCH_FEATURE_INTERVAL_SPEAKING_SEC', '0.3'))
             while not self._closed:
+                # Adjust interval based on speaking state
+                if bool(self._state.get('speaking')):
+                    interval = max(base_interval, speak_interval)
+                else:
+                    interval = base_interval
                 await asyncio.sleep(interval)
                 if self._call is None:
                     continue

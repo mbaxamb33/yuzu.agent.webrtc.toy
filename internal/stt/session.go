@@ -37,6 +37,10 @@ type Session struct {
     endpointPolicy string // "provider" | "earliest"
     finalEmitted bool
     lastFinalText string
+    lastSpeechStarted time.Time
+    lastUtteranceEndAt time.Time
+    lastInterimAt time.Time
+    inUtterance bool
 }
 
 func NewSession(parent context.Context, sessionID string) *Session {
@@ -61,8 +65,42 @@ func (s *Session) run() {
     for e := range s.dg.Events {
         switch e.Type {
         case "interim":
+            now := time.Now()
+            // Guardrail: if finalEmitted is stuck true and we've been seeing interims for > X ms, force reset
+            // This handles cases where UtteranceEnd was missed/dropped
+            if s.finalEmitted && !s.lastInterimAt.IsZero() {
+                stuckMs := 1200
+                if v := os.Getenv("STT_STUCK_FINAL_RESET_MS"); v != "" { fmt.Sscanf(v, "%d", &stuckMs) }
+                if now.Sub(s.lastInterimAt) < time.Duration(stuckMs)*time.Millisecond {
+                    // We've been getting interims continuously - check how long since final was emitted
+                    // Use startedAt as a proxy for when the final was emitted
+                    if now.Sub(s.startedAt) >= time.Duration(stuckMs)*time.Millisecond {
+                        log.Printf("[stt] GUARDRAIL: forcing reset of stuck finalEmitted after %dms of interims session=%s", stuckMs, s.id)
+                        s.finalEmitted = false
+                        s.lastFinalText = ""
+                        s.inUtterance = false
+                        metricUtteranceEvents.WithLabelValues("guardrail_reset").Inc()
+                    }
+                }
+            }
+            // If idle (no active utterance), consider committing a new utterance based on silence and interim length
+            if !s.inUtterance {
+                minSil := 700
+                if v := os.Getenv("MIN_SILENCE_FOR_NEW_UTTER_MS"); v != "" { fmt.Sscanf(v, "%d", &minSil) }
+                minChars := 4
+                if v := os.Getenv("MIN_INTERIM_CHARS_FOR_NEW_UTTER"); v != "" { fmt.Sscanf(v, "%d", &minChars) }
+                prevInterimAt := s.lastInterimAt
+                silenceOK := prevInterimAt.IsZero() || now.Sub(prevInterimAt) >= time.Duration(minSil)*time.Millisecond || (!s.lastUtteranceEndAt.IsZero() && now.Sub(s.lastUtteranceEndAt) >= 0)
+                if len(strings.TrimSpace(e.Text)) >= minChars && silenceOK {
+                    newID := fmt.Sprintf("utt-%d", now.UnixMilli())
+                    log.Printf("[stt] committing new utterance on interim id=%s session=%s", newID, s.id)
+                    s.StartUtterance(newID)
+                    s.inUtterance = true
+                }
+            }
             log.Printf("[stt] interim transcript session=%s text=%q", s.id, e.Text)
             s.lastInterim = e.Text
+            s.lastInterimAt = time.Now()
             if !s.seenFirstInterim && !s.startedAt.IsZero() {
                 s.seenFirstInterim = true
                 ms := time.Since(s.startedAt).Milliseconds()
@@ -70,6 +108,7 @@ func (s *Session) run() {
             }
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Interim{Interim: &pb.TranscriptInterim{SessionId: s.id, UtteranceId: s.utterID, Text: e.Text}}}
         case "final":
+            now := time.Now()
             log.Printf("[stt] final transcript received session=%s text=%q finalEmitted=%v", s.id, e.Text, s.finalEmitted)
             // Skip empty finals
             if strings.TrimSpace(e.Text) == "" {
@@ -83,10 +122,19 @@ func (s *Session) run() {
                     log.Printf("[stt] skipping duplicate final session=%s (same text)", s.id)
                     continue
                 }
-                // Heuristic: treat subsequent finals as new utterances when provider boundaries are late.
-                newID := fmt.Sprintf("utt-%d", time.Now().UnixMilli())
-                log.Printf("[stt] rolling to new utterance for subsequent final; new id=%s session=%s", newID, s.id)
-                s.StartUtterance(newID)
+                // Narrow rollover: require recent boundary or silence gap before creating a new utterance
+                minSil := 700
+                if v := os.Getenv("MIN_SILENCE_FOR_NEW_UTTER_MS"); v != "" { fmt.Sscanf(v, "%d", &minSil) }
+                boundaryOK := !s.lastUtteranceEndAt.IsZero() && now.Sub(s.lastUtteranceEndAt) <= 3*time.Second
+                silenceOK := s.lastInterimAt.IsZero() || now.Sub(s.lastInterimAt) >= time.Duration(minSil)*time.Millisecond
+                if boundaryOK || silenceOK {
+                    newID := fmt.Sprintf("utt-%d", now.UnixMilli())
+                    log.Printf("[stt] rolling to new utterance for subsequent final; new id=%s session=%s", newID, s.id)
+                    s.StartUtterance(newID)
+                } else {
+                    log.Printf("[stt] skipping subsequent final (no boundary/silence) session=%s", s.id)
+                    continue
+                }
             }
             if !s.drainAt.IsZero() {
                 ms := time.Since(s.drainAt).Milliseconds()
@@ -99,6 +147,17 @@ func (s *Session) run() {
         case "error":
             log.Printf("[stt] error session=%s msg=%s", s.id, e.Text)
             s.events <- &pb.ServerMessage{Msg: &pb.ServerMessage_Error{Error: &pb.Error{SessionId: s.id, EnumCode: pb.ErrorCode_PROVIDER_ERROR, Message: e.Text}}}
+        case "reconnected":
+            // Defensive reset on provider reconnect
+            log.Printf("[stt] provider reconnected; resetting session state session=%s", s.id)
+            s.finalEmitted = false
+            s.lastFinalText = ""
+            s.lastInterim = ""
+            s.seenFirstInterim = false
+            s.startedAt = time.Now()
+            s.inUtterance = false
+            s.lastUtteranceEndAt = time.Now()
+            metricUtteranceEvents.WithLabelValues("guardrail_reset").Inc()
         case "utterance_end":
             // Reset gating so subsequent utterances can be transcribed
             log.Printf("[stt] utterance_end received, resetting gating session=%s (finalEmitted was %v)", s.id, s.finalEmitted)
@@ -107,12 +166,18 @@ func (s *Session) run() {
             s.seenFirstInterim = false
             s.startedAt = time.Now()
             s.lastFinalText = ""
+            s.inUtterance = false
+            s.lastUtteranceEndAt = time.Now()
             metricUtteranceEvents.WithLabelValues("utterance_end").Inc()
         case "speech_started":
-            // Start a new utterance in continuous mode to ensure fresh utterance_id and per-utterance metrics
-            newID := fmt.Sprintf("utt-%d", time.Now().UnixMilli())
-            log.Printf("[stt] speech_started: starting new utterance id=%s session=%s", newID, s.id)
-            s.StartUtterance(newID)
+            // Treat SpeechStarted as a hint only; log/metric, do not segment on it
+            now := time.Now()
+            if !s.lastSpeechStarted.IsZero() && now.Sub(s.lastSpeechStarted) < 250*time.Millisecond {
+                log.Printf("[stt] speech_started ignored (debounced) session=%s", s.id)
+                break
+            }
+            s.lastSpeechStarted = now
+            log.Printf("[stt] speech_started hint session=%s", s.id)
             metricUtteranceEvents.WithLabelValues("speech_started").Inc()
         case "meta":
             // ignore or surface in future
@@ -130,6 +195,7 @@ func (s *Session) StartUtterance(utterID string) {
     s.finalEmitted = false
     s.lastInterim = ""
     s.drainAt = time.Time{}
+    s.inUtterance = true
     s.mu.Unlock()
 }
 

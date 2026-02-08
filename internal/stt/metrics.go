@@ -75,4 +75,10 @@ var (
         Name: "stt_utterance_events_total",
         Help: "Utterance boundary events observed",
     }, []string{"type"}) // speech_started, utterance_end
+
+    // Event channel drops
+    metricEventDrops = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "stt_event_drops_total",
+        Help: "Events dropped due to slow consumer (channel backpressure)",
+    })
 )

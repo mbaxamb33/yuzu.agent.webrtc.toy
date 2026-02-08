@@ -150,12 +150,22 @@ func (d *DeepgramConn) connectAndPump() error {
         d.ws = nil
     }()
 
+    // Emit a reconnect/reset hint so session can clear state defensively
+    d.emit(DGEvent{Type: "reconnected"})
+
     // Start send and recv loops
     sendDone := make(chan struct{})
     var bytesSent uint64
     var framesSent uint64
     go func() {
         defer close(sendDone)
+        // Keepalive: inject a silent 20ms frame if no data sent for a while
+        keepAliveMs := atoiEnv("STT_KEEPALIVE_MS", 400)
+        keepTicker := time.NewTicker(time.Duration(keepAliveMs) * time.Millisecond)
+        defer keepTicker.Stop()
+        lastSend := time.Now()
+        // Precomputed 20ms silent frame @16kHz mono, PCM16 (640 bytes)
+        silent := make([]byte, 640)
         for {
             select {
             case <-d.ctx.Done():
@@ -173,6 +183,7 @@ func (d *DeepgramConn) connectAndPump() error {
                 }
                 bytesSent += uint64(len(b))
                 framesSent++
+                lastSend = time.Now()
                 if framesSent == 1 || framesSent%100 == 0 {
                     // Log first 16 bytes hex for format verification
                     hexPrefix := ""
@@ -180,6 +191,22 @@ func (d *DeepgramConn) connectAndPump() error {
                         hexPrefix = fmt.Sprintf(" hex[0:16]=%x", b[:16])
                     }
                     log.Printf("[deepgram] sent frames=%d bytes=%d%s", framesSent, bytesSent, hexPrefix)
+                }
+            case <-keepTicker.C:
+                // Only send keepalive if no recent data and the queue is empty
+                if len(d.sendQ) == 0 && time.Since(lastSend) >= time.Duration(keepAliveMs)*time.Millisecond {
+                    wctx, cancel := context.WithTimeout(d.ctx, 2*time.Second)
+                    err := d.ws.Write(wctx, websocket.MessageBinary, silent)
+                    cancel()
+                    if err != nil {
+                        log.Printf("[deepgram] keepalive write error: %v", err)
+                        return
+                    }
+                    bytesSent += uint64(len(silent))
+                    framesSent++
+                    lastSend = time.Now()
+                    // Log first keepalive after idle
+                    log.Printf("[deepgram] keepalive sent (idle %dms)", keepAliveMs)
                 }
             }
         }
@@ -238,12 +265,37 @@ func (d *DeepgramConn) connectAndPump() error {
             d.emit(DGEvent{Type: "meta", Raw: m})
             continue
         }
-        if strings.EqualFold(typ, "SpeechStarted") {
+        // Handle UtteranceEnd FIRST - before Results check, since UtteranceEnd also has a "channel" field
+        if strings.EqualFold(typ, "UtteranceEnd") {
+            // UtteranceEnd signals end of speech - use last known text if we haven't emitted a final yet
+            // This is a fallback in case is_final results were missed
+            fallbackText := d.lastFinalText
+            source := "provider_cached"
+            if fallbackText == "" {
+                fallbackText = d.lastText
+                source = "interim_fallback"
+            }
+            log.Printf("[deepgram] UtteranceEnd parsed, emitting utterance_end; fallback_text=%q source=%s lastFinal=%q lastText=%q",
+                fallbackText, source, d.lastFinalText, d.lastText)
+            // Emit UtteranceEnd as final if we have text - session.go will handle deduplication
+            if fallbackText != "" {
+                d.emit(DGEvent{Type: "final", Text: fallbackText, Raw: m})
+                metricFinalEmitted.WithLabelValues(source).Inc()
+            } else {
+                log.Printf("[deepgram] UtteranceEnd with no text to emit")
+                metricEmptyFinalSkipped.Inc()
+            }
+            // Reset tracking for next utterance
+            d.lastText = ""
+            d.lastFinalText = ""
+            // Signal session to reset finalEmitted so next utterance can be transcribed
+            d.emit(DGEvent{Type: "utterance_end", Raw: m})
+        } else if strings.EqualFold(typ, "SpeechStarted") {
             // SpeechStarted boundary: notify session so it can start a fresh utterance in continuous mode.
             // Do not clear lastText/lastFinalText here; UtteranceEnd handles reset post-final.
             log.Printf("[deepgram] SpeechStarted detected (text tracking preserved)")
             d.emit(DGEvent{Type: "speech_started", Raw: m})
-        } else if strings.EqualFold(typ, "Results") || m["channel"] != nil {
+        } else if strings.EqualFold(typ, "Results") {
             // Deepgram puts alternatives under "channel", not "results"
             var channel map[string]any
             if v, ok := m["channel"].(map[string]any); ok {
@@ -283,31 +335,8 @@ func (d *DeepgramConn) connectAndPump() error {
                     d.emit(DGEvent{Type: "interim", Text: text, Raw: m})
                 }
             }
-        } else if strings.EqualFold(typ, "UtteranceEnd") {
-            // UtteranceEnd signals end of speech - use last known text if we haven't emitted a final yet
-            // This is a fallback in case is_final results were missed
-            fallbackText := d.lastFinalText
-            source := "provider_cached"
-            if fallbackText == "" {
-                fallbackText = d.lastText
-                source = "interim_fallback"
-            }
-            log.Printf("[deepgram] UtteranceEnd received, fallback_text=%q source=%s lastFinal=%q lastText=%q",
-                fallbackText, source, d.lastFinalText, d.lastText)
-            // Emit UtteranceEnd as final - session.go will handle deduplication
-            if fallbackText != "" {
-                d.emit(DGEvent{Type: "final", Text: fallbackText, Raw: m})
-                metricFinalEmitted.WithLabelValues(source).Inc()
-            } else {
-                log.Printf("[deepgram] UtteranceEnd with no text to emit")
-                metricEmptyFinalSkipped.Inc()
-            }
-            // Reset tracking for next utterance
-            d.lastText = ""
-            d.lastFinalText = ""
-            // Signal session to reset finalEmitted so next utterance can be transcribed
-            d.emit(DGEvent{Type: "utterance_end", Raw: m})
         }
+        // Note: UtteranceEnd is handled at the top of the if-else chain
     }
 }
 
@@ -315,7 +344,9 @@ func (d *DeepgramConn) emit(e DGEvent) {
     select {
     case d.Events <- e:
     default:
-        // drop if slow consumer
+        // drop if slow consumer - log this so we can diagnose issues
+        log.Printf("[deepgram] DROPPED event type=%s text=%q (channel full, len=%d)", e.Type, e.Text, len(d.Events))
+        metricEventDrops.Inc()
     }
 }
 
